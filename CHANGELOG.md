@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muse-spark-1.3` support: shared `sparkModel()` fallbacks, video/audio input advertisement, and thinking `max` → `max` on standard 1.3 (upstream PR #14).
+- Per-key entitlement probe for `reasoning.encrypted_content`; the include is stripped for keys Meta rejects, so cross-turn reasoning never 400s (upstream PR #18).
+- API-key identification: `/login meta` offers a method choice between the browser device flow and pasting a Model API key. Pasted keys are validated against `GET /v1/models`, stored with a `static-api-key:` refresh marker, and passed through unchanged by the daily refresh.
+
+### Changed
+
+- Support pi 0.85.x: peer range `>=0.83.0 <0.86.0`, devDeps 0.85.1, legacy-shape test casts (upstream PR #18).
+
 ## [0.6.1] - 2026-09-04
 
 ### Fixed
