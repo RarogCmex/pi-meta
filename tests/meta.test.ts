@@ -210,7 +210,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const before = Date.now();
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({
@@ -252,7 +252,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: false,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () => {
 			fetchCalled = true;
 			throw new Error("network should not be used");
@@ -374,7 +374,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({ data: [] })) as unknown as typeof fetch);
 
@@ -407,7 +407,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () => {
 			throw new Error("catalog unreachable");
 		}) as unknown as typeof fetch);
