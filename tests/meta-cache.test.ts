@@ -2,14 +2,19 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	applyMetaResponsesCacheHints,
 	createMetaProviderConfig,
 	META_API_BASE_URL,
+	META_MODEL_CATALOG_URL,
 	META_PROMPT_CACHE_RETENTION,
 	META_PROVIDER_ID,
 	probeEncryptedReasoningEntitlement,
+	resetCatalogRefreshState,
+	shouldRefreshCatalog,
+	startLiveCatalogRefresh,
 	toProviderModels,
 } from "../extensions/meta.ts";
 import metaOAuthProvider from "../extensions/meta.ts";
@@ -17,8 +22,16 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const LIVE_CACHE_MODEL = "muse-spark-1.2-contributor";
+function jsonResponse(body: unknown, status = 200): Response {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
 const LIVE_CACHE_KEY = "pi-meta-oauth-live-cache-probe-v1";
+/** Fallback probe target; the live catalog's first id wins when it resolves. */
+const LIVE_CACHE_MODEL_FALLBACK = "muse-spark-1.2-contributor";
 
 function resolveLiveMetaApiKey(): string | undefined {
 	for (const value of [
@@ -31,7 +44,9 @@ function resolveLiveMetaApiKey(): string | undefined {
 	try {
 		const auth = JSON.parse(
 			readFileSync(join(homedir(), ".pi/agent/auth.json"), "utf8"),
-		) as { meta?: { access?: unknown; expires?: unknown } };
+		) as {
+			meta?: { type?: string; key?: unknown; access?: unknown; expires?: unknown };
+		};
 		// auth.meta.expires is epoch milliseconds; an expired token must not turn
 		// every test run into a hard 401 — treat it as no credential.
 		if (
@@ -40,8 +55,11 @@ function resolveLiveMetaApiKey(): string | undefined {
 		) {
 			return undefined;
 		}
-		return typeof auth.meta?.access === "string" && auth.meta.access.trim()
-			? auth.meta.access.trim()
+		// Pi stores a pasted Model API key as { type: "api_key", key } and a
+		// device-flow credential as { type: "oauth", access }.
+		const candidate = auth.meta?.key ?? auth.meta?.access;
+		return typeof candidate === "string" && candidate.trim()
+			? candidate.trim()
 			: undefined;
 	} catch {
 		return undefined;
@@ -50,6 +68,36 @@ function resolveLiveMetaApiKey(): string | undefined {
 
 const liveApiKey = resolveLiveMetaApiKey();
 const liveCacheTest = liveApiKey ? test : test.skip;
+
+/**
+ * Keys are scoped to different id sets: a subscription key may expose only
+ * internal ids while the public `muse-spark-*` ids answer 404. Resolve the
+ * probe model from the live catalog so the cache measurement runs against an
+ * id the key can actually reach.
+ */
+async function resolveLiveCacheModel(apiKey: string): Promise<string> {
+	try {
+		const response = await fetch(META_MODEL_CATALOG_URL, {
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				"x-api-version": "1.0.0",
+			},
+		});
+		if (response.ok) {
+			const body = (await response.json()) as {
+				data?: Array<{ id?: unknown }>;
+			};
+			const first = body.data?.find(
+				(entry) => typeof entry.id === "string" && entry.id,
+			)?.id as string | undefined;
+			if (first) return first;
+		}
+	} catch {
+		// Fall through to the bundled probe id.
+	}
+	return LIVE_CACHE_MODEL_FALLBACK;
+}
 
 function fallbackModels() {
 	const models = createMetaProviderConfig().models ?? [];
@@ -83,9 +131,11 @@ async function captureResponsesRequest(options?: {
 	let payload: Record<string, unknown> | undefined;
 	const events = streamSimple(
 		museModel(),
-		{
+		// Pi 0.86 hands provider streams a branded TranscriptContext; normalizeContext
+		// is the only public constructor for one.
+		normalizeContext({
 			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
-		},
+		}),
 		{
 			apiKey: "test-key",
 			sessionId: options?.sessionId ?? "sid",
@@ -173,16 +223,11 @@ describe("Meta Responses cache and reasoning contracts", () => {
 		});
 	});
 
-	test("advertises text/image plus video/audio inputs on fallbacks", () => {
+	test("advertises the text and image inputs Muse Spark actually accepts", async () => {
 		for (const model of fallbackModels()) {
-			// input is text|image in pi-ai 0.83/0.84 types; fallbacks advertise
-			// video/audio via the same cast as sparkModel().
-			expect(model.input as unknown as string[]).toEqual([
-				"text",
-				"image",
-				"video",
-				"audio",
-			]);
+			// Pi types Model.input as ("text" | "image")[] through 0.86; video and
+			// audio cannot be attached, so advertising them would only mislead gating.
+			expect(model.input).toEqual(["text", "image"]);
 		}
 		expect(
 			toProviderModels({
@@ -267,6 +312,7 @@ describe("Meta Responses cache and reasoning contracts", () => {
 	test("probes encrypted-reasoning entitlement: 200 means entitled", async () => {
 		const known = await probeEncryptedReasoningEntitlement(
 			"test-key",
+			"muse-spark-1.2-contributor",
 			(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
 		);
 		expect(known).toBe(true);
@@ -275,6 +321,7 @@ describe("Meta Responses cache and reasoning contracts", () => {
 	test("probe reports not entitled when Meta rejects encrypted_content", async () => {
 		const known = await probeEncryptedReasoningEntitlement(
 			"test-key",
+			"muse-spark-1.2-contributor",
 			(async () =>
 				new Response(
 					'{"type":"invalid_request_error","message":"reasoning `encrypted_content` was not issued to this caller"}',
@@ -287,7 +334,40 @@ describe("Meta Responses cache and reasoning contracts", () => {
 	test("probe is inconclusive on transient errors", async () => {
 		const known = await probeEncryptedReasoningEntitlement(
 			"test-key",
+			"muse-spark-1.2-contributor",
 			(async () => new Response("{}", { status: 502 })) as unknown as typeof fetch,
+		);
+		expect(known).toBeUndefined();
+	});
+
+	// Keys are scoped to different id sets: a subscription key may expose only
+	// internal ids while `muse-spark-1.3` answers 404 model_not_found. Probing a
+	// fixed id would then misread "unknown model" as "not entitled".
+	test("probe names the model in use, never a fixed id", async () => {
+		const bodies: unknown[] = [];
+		await probeEncryptedReasoningEntitlement(
+			"test-key",
+			"rl-muse-spark-1-3-sglang-playground",
+			(async (_input: unknown, init?: RequestInit) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response("{}", { status: 404 });
+			}) as unknown as typeof fetch,
+		);
+		expect(bodies[0]).toMatchObject({
+			model: "rl-muse-spark-1-3-sglang-playground",
+			include: ["reasoning.encrypted_content"],
+		});
+	});
+
+	test("probe is inconclusive when Meta does not know the model", async () => {
+		const known = await probeEncryptedReasoningEntitlement(
+			"test-key",
+			"muse-spark-1.3",
+			(async () =>
+				new Response(
+					'{"error":{"code":"model_not_found","message":"The requested model was not found."}}',
+					{ status: 404 },
+				)) as unknown as typeof fetch,
 		);
 		expect(known).toBeUndefined();
 	});
@@ -347,7 +427,7 @@ describe("Meta Responses cache and reasoning contracts", () => {
 	test("registers a Meta-only before_provider_request hook that applies the hints", async () => {
 		type RequestHandler = (
 			event: { payload: unknown },
-			ctx: { model?: { provider: string } },
+			ctx: { model?: { provider: string; id?: string } },
 		) => unknown;
 		let handler: RequestHandler | undefined;
 		metaOAuthProvider({
@@ -362,18 +442,188 @@ describe("Meta Responses cache and reasoning contracts", () => {
 
 		const other = await handler?.(
 			{ payload: { model: "gpt" } },
-			{ model: { provider: "openai" } },
+			{ model: { provider: "openai", id: "gpt" } },
 		);
 		expect(other).toBeUndefined();
 
 		const meta = await handler?.(
 			{ payload: { model: "muse-spark-1.2" } },
-			{ model: { provider: META_PROVIDER_ID } },
+			{ model: { provider: META_PROVIDER_ID, id: "muse-spark-1.2" } },
 		);
 		expect(meta).toMatchObject({
 			model: "muse-spark-1.2",
 			prompt_cache_retention: "24h",
 		});
+	});
+
+	// Pi 0.86 runs every in-session refresh with allowNetwork:false, and the
+	// only networked caller (pi update --models) does not load extensions. An
+	// extension-triggered live pass is also superseded by pi's startup refresh
+	// storm, so the extension fetches the catalog itself and re-registers.
+	test("discovers the live catalog once per cooldown window", async () => {
+		resetCatalogRefreshState();
+		const registered: unknown[] = [];
+		let authCalls = 0;
+		const pi = {
+			registerProvider: (_id: string, config: unknown) => {
+				registered.push(config);
+			},
+		} as unknown as ExtensionAPI;
+		const ctx = {
+			modelRegistry: {
+				getProviderAuth: async () => {
+					authCalls += 1;
+					return { auth: { apiKey: "model-api-key" } };
+				},
+			},
+		} as unknown as Parameters<typeof startLiveCatalogRefresh>[1];
+		const fetchMock = (async () =>
+			jsonResponse({ data: [{ id: "muse-spark-1.2" }] })) as unknown as typeof fetch;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		try {
+			const first = startLiveCatalogRefresh(pi, ctx, 0);
+			expect(first).toBeDefined();
+			expect(startLiveCatalogRefresh(pi, ctx, 1_000)).toBeUndefined();
+			await first;
+
+			expect(authCalls).toBe(1);
+			expect(registered).toHaveLength(1);
+			expect(registered[0]).toMatchObject({
+				api: "openai-responses",
+				models: [expect.objectContaining({ id: "muse-spark-1.2" })],
+			});
+
+			// Past the 4h cooldown the next session start refreshes again.
+			await startLiveCatalogRefresh(pi, ctx, 4 * 60 * 60 * 1000 + 1);
+			expect(registered).toHaveLength(2);
+			expect(authCalls).toBe(2);
+		} finally {
+			globalThis.fetch = originalFetch;
+			resetCatalogRefreshState();
+		}
+	});
+
+	test("a failed catalog fetch never breaks session startup", async () => {
+		resetCatalogRefreshState();
+		const pi = {
+			registerProvider: () => {
+				throw new Error("should not register");
+			},
+		} as unknown as ExtensionAPI;
+		const ctx = {
+			modelRegistry: {
+				getProviderAuth: async () => {
+					throw new Error("catalog unreachable");
+				},
+			},
+		} as unknown as Parameters<typeof startLiveCatalogRefresh>[1];
+		await expect(
+			startLiveCatalogRefresh(pi, ctx, 0),
+		).resolves.toBeUndefined();
+		// The attempt is recorded, so a failure cannot retry-storm on every event.
+		expect(shouldRefreshCatalog(1_000)).toBe(false);
+		resetCatalogRefreshState();
+	});
+
+	test("skips discovery when no Meta key resolves", async () => {
+		resetCatalogRefreshState();
+		let registered = false;
+		const pi = {
+			registerProvider: () => {
+				registered = true;
+			},
+		} as unknown as ExtensionAPI;
+		const ctx = {
+			modelRegistry: {
+				getProviderAuth: async () => undefined,
+			},
+		} as unknown as Parameters<typeof startLiveCatalogRefresh>[1];
+		await startLiveCatalogRefresh(pi, ctx, 0);
+		expect(registered).toBe(false);
+		resetCatalogRefreshState();
+	});
+
+	test("stays offline when PI_OFFLINE is set", async () => {
+		resetCatalogRefreshState();
+		const previous = process.env["PI_OFFLINE"];
+		process.env["PI_OFFLINE"] = "1";
+		try {
+			let called = false;
+			const pi = { registerProvider: () => {} } as unknown as ExtensionAPI;
+			const ctx = {
+				modelRegistry: {
+					getProviderAuth: async () => {
+						called = true;
+						return { auth: { apiKey: "model-api-key" } };
+					},
+				},
+			} as unknown as Parameters<typeof startLiveCatalogRefresh>[1];
+			expect(startLiveCatalogRefresh(pi, ctx, 0)).toBeUndefined();
+			expect(called).toBe(false);
+		} finally {
+			if (previous === undefined) delete process.env["PI_OFFLINE"];
+			else process.env["PI_OFFLINE"] = previous;
+			resetCatalogRefreshState();
+		}
+	});
+
+	test("requests the live catalog on session start", async () => {
+		resetCatalogRefreshState();
+		const handlers = new Map<string, unknown>();
+		const registered: unknown[] = [];
+		metaOAuthProvider({
+			registerProvider(_id: string, config?: unknown) {
+				if (config) registered.push(config);
+			},
+			on(event: string, next: unknown) {
+				handlers.set(event, next);
+			},
+		} as unknown as ExtensionAPI);
+		const sessionStart = handlers.get("session_start") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		expect(sessionStart).toBeTypeOf("function");
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			jsonResponse({
+				data: [{ id: "rl-muse-spark-1-3-sglang-playground" }],
+			})) as unknown as typeof fetch;
+		try {
+			await sessionStart?.(
+				{ type: "session_start", reason: "startup" },
+				{
+					modelRegistry: {
+						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
+					},
+				},
+			);
+			// The hook is fire-and-forget so session startup never blocks on Meta;
+			// wait for the in-flight pass to settle before asserting.
+			const deadline = Date.now() + 5_000;
+			let live: unknown[] = [];
+			for (;;) {
+				live = registered.filter((config) => {
+					const models =
+						(config as { models?: Array<{ id: string }> }).models ?? [];
+					return models.some(
+						(model) => model.id === "rl-muse-spark-1-3-sglang-playground",
+					);
+				});
+				if (live.length > 0 || Date.now() > deadline) break;
+				await Bun.sleep(25);
+			}
+			// One re-registration carrying the live ids, after the bundled default.
+			expect(live).toHaveLength(1);
+		} finally {
+			globalThis.fetch = originalFetch;
+			resetCatalogRefreshState();
+		}
+	});
+
+	test("reports Muse as subscription-backed like pi's built-in provider", () => {
+		const config = createMetaProviderConfig();
+		expect(config.oauth?.isSubscription).toBe(true);
 	});
 });
 
@@ -391,9 +641,9 @@ function liveCachePrefix(): string {
 	return lines.join("\n");
 }
 
-function liveCachePayload(): Record<string, unknown> {
+function liveCachePayload(model: string): Record<string, unknown> {
 	return {
-		model: LIVE_CACHE_MODEL,
+		model,
 		prompt_cache_key: LIVE_CACHE_KEY,
 		max_output_tokens: 16,
 		input: [
@@ -457,7 +707,7 @@ describe("Meta live prompt-cache probe", () => {
 		"second identical Responses call reports cached tokens",
 		async () => {
 			if (!liveApiKey) throw new Error("PI_META_LIVE_API_KEY is required");
-			const payload = liveCachePayload();
+			const payload = liveCachePayload(await resolveLiveCacheModel(liveApiKey));
 			const first = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let second = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let cacheRead = second.usage?.input_tokens_details?.cached_tokens ?? 0;

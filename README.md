@@ -12,7 +12,14 @@ Meta Model API OAuth for [pi](https://pi.dev).
 - Send `prompt_cache_retention: "24h"` on Meta Responses requests unless the payload already set a retention
 - Device authorization against `https://auth.meta.com`
 - Model API-key minting through `POST https://api.meta.ai/muse-code/key`
-- Dynamic Muse model catalog from `GET https://api.meta.ai/v1/models`
+- Live Muse catalog discovery from `GET https://api.meta.ai/v1/models` on session start, so account-specific model ids work too
+- Strict JSON-schema tool sampling and subscription-aware usage reporting, matching pi 0.86's built-in Meta provider
+
+Pi 0.86 added a built-in Meta provider, but it ships a static `muse-spark-*`
+catalog. Keys whose account exposes different ids (for example
+`rl-muse-spark-1-3-sglang-playground`) get HTTP 404 `model_not_found` from it.
+This extension keeps working for those keys: it fetches your real catalog and
+registers exactly the ids your key can reach.
 
 ## Install
 
@@ -68,8 +75,8 @@ Cross-turn reasoning continuity needs `include: ["reasoning.encrypted_content"]`
 but not every key is entitled to it: keys minted through `/muse-code/key`
 can answer HTTP 400 `reasoning \`encrypted_content\` was not issued to this
 caller`, which fails the whole request. So the provider probes each key once
-per process — a ~16-token `/v1/responses` call carrying the include with
-`max_output_tokens: 16` — and:
+per process and model — a ~16-token `/v1/responses` call carrying the include
+with `max_output_tokens: 16`, naming the model actually in use — and:
 
 - **200** → the key is entitled: the include is kept, reasoning carries across turns;
 - **400 mentioning `encrypted_content`** → the include is stripped on every request, so calls never 400;
@@ -81,9 +88,9 @@ entitlement policy, a restart (or daily key rotation) picks it up.
 
 ## Models
 
-Fallback models use a 1,048,576-token context window, up to 256K output tokens, image/video/audio input, and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`. `muse-spark-1.3` also maps thinking `max` → `max`.
+Fallback models use a 1,048,576-token context window, up to 256K output tokens, text and image input, and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`. `muse-spark-1.3` also maps thinking `max` → `max`.
 
-Meta Model API ids only (not OpenCode Zen `*-contributor-free`):
+The fallback list covers the public Meta Model API ids (not OpenCode Zen `*-contributor-free`). When your key exposes different, account-specific ids, the live catalog discovered on session start replaces this list:
 
 | id | pricing (input/output/cached) $/M |
 | --- | --- |
@@ -103,14 +110,16 @@ To scope Pi's model picker to Meta models:
 
 ### Making context windows visible to external tools
 
-After a successful network model refresh, the extension persists the Meta
-catalog to `~/.pi/agent/models-store.json`. External usage tools such as
+Pi 0.86 runs every in-session model refresh with `allowNetwork: false`, and the
+only networked caller (`pi update --models`) does not load extensions — it
+refreshes pi's built-in static Meta catalog instead. So this extension fetches
+`GET /v1/models` itself on `session_start` (cooldown: 4h per process, skipped
+under `PI_OFFLINE`) and re-registers the provider with the fetched ids. The
+result is persisted to `~/.pi/agent/models-store.json`, repairing a stale store
+left by the built-in provider. External usage tools such as
 [herdr-agent-usage](https://github.com/senna-lang/herdr-agent-usage) can then
 show a percentage (for example, `⛁ 2% (24k)`) instead of only an absolute token
-count. Pi writes the cache during interactive or RPC startup, and again after
-`/login meta`. `pi --list-models meta` lists currently available models but does
-not itself trigger a network catalog refresh. The cached catalog is also used
-when Pi starts without network access.
+count. The cached catalog is also used when Pi starts without network access.
 
 The bundled fallback uses Meta's nominal `1,048,576`-token context window. A
 cached Muse Code 0.1.0/R708.1 catalog observed on 2026-08-06 reported a lower
@@ -125,6 +134,8 @@ catalog.
 ```bash
 pi --list-models meta
 pi -p --provider meta --model muse-spark-1.3 "Reply exactly: META_OK"
+# account-specific ids from your live catalog work too, e.g.:
+pi -p --provider meta --model rl-muse-spark-1-3-sglang-playground "Reply exactly: META_OK"
 bun run typecheck
 bun test
 ```

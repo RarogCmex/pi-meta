@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ProviderConfig,
 } from "@earendil-works/pi-coding-agent";
 
@@ -23,6 +24,22 @@ const DEVICE_TOKEN_URL = `${META_AUTH_BASE_URL}/oidc/device/token/`;
 const API_KEY_MINT_URL = "https://api.meta.ai/muse-code/key";
 const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 const API_KEY_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Pi 0.86 never runs a networked catalog refresh inside a session:
+ * `createAgentSessionServices()` builds its ModelRuntime without
+ * `allowModelNetwork`, and `registerProvider()` only triggers
+ * `refresh({ allowNetwork: false })`. The one networked caller,
+ * `pi update --models`, does not load extensions at all, so it refreshes the
+ * built-in static Meta catalog instead of this one. Asking pi for a live
+ * refresh from `session_start` does not help either: pi's startup fires
+ * dozens of offline refreshes, and `Models.beginProviderRefresh()` supersedes
+ * (aborts) an in-flight refresh of the same provider. The extension therefore
+ * fetches the catalog itself and re-registers the provider; see
+ * `startLiveCatalogRefresh()`.
+ */
+const CATALOG_REFRESH_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+const CATALOG_REFRESH_TIMEOUT_MS = 20 * 1000;
 
 /**
  * Marks credentials created by pasting a Model API key instead of the device
@@ -101,6 +118,32 @@ const SPARK_THINKING: NonNullable<MetaProviderModel["thinkingLevelMap"]> = {
 	max: null,
 };
 
+/** Muse Spark is a vision model; the public catalog advertises text+image. */
+const DEFAULT_INPUT: MetaProviderModel["input"] = ["text", "image"];
+
+/**
+ * Wire compatibility, measured against `api.meta.ai/v1/responses` on
+ * 2026-09-20:
+ * - `strict: true` function tools are accepted and constrained as long as the
+ *   schema carries `additionalProperties: false`, which pi's strict converter
+ *   always adds. Without this flag pi 0.86's default strict-prefer sampling
+ *   for read/bash/edit/write never reaches Meta.
+ * - `tool_search_call`/`tool_search_output` items are accepted but ignored:
+ *   a tool announced only through them is never called, while the same tool
+ *   in `tools` is. So tool search stays off and pi keeps sending the full
+ *   current tool list, which also covers tools added mid-conversation.
+ * - `prompt_cache_retention: "24h"` is accepted and produces cache hits, so
+ *   long retention stays enabled. `promptCache` lifetimes are deliberately
+ *   not advertised: Meta never echoes the retention it applied, so pi 0.86's
+ *   cost-aware cache warming would fire on a guessed cadence.
+ */
+type MetaCompat = NonNullable<Model<"openai-responses">["compat"]>;
+const SPARK_COMPAT: MetaCompat = {
+	supportsLongCacheRetention: true,
+	supportsStrictMode: true,
+	supportsToolSearch: false,
+};
+
 function sparkModel(
 	id: string,
 	name: string,
@@ -114,17 +157,13 @@ function sparkModel(
 		name,
 		reasoning: true,
 		thinkingLevelMap,
-		// SAFETY: pi-ai 0.83/0.84 Model.input is text|image only; video/audio are advertised for later pi-ai and rewritten in media.ts.
-		input: [
-			"text",
-			"image",
-			"video",
-			"audio",
-		] as unknown as MetaProviderModel["input"],
+		// pi-ai types Model.input as ("text" | "image")[] through 0.86; pi cannot
+		// attach video or audio, so advertising them would only mislead gating.
+		input: [...DEFAULT_INPUT],
 		cost,
 		contextWindow: 1_048_576,
 		maxTokens: 256_000,
-		compat: { supportsReasoningEffort: true, supportsToolSearch: true },
+		compat: { ...SPARK_COMPAT },
 	};
 }
 
@@ -428,9 +467,18 @@ function numericCost(value: unknown, fallback: number): number {
 
 function displayName(id: string): string {
 	return id
-		.split("-")
+		.split(/[-_. ]+/)
+		.filter(Boolean)
 		.map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
 		.join(" ");
+}
+
+function catalogDisplayName(raw: unknown, id: string): string | undefined {
+	if (typeof raw !== "string") return undefined;
+	const trimmed = raw.trim();
+	if (!trimmed) return undefined;
+	if (trimmed.toLowerCase() === id.toLowerCase()) return undefined;
+	return trimmed;
 }
 
 function modalitiesToInput(
@@ -438,8 +486,9 @@ function modalitiesToInput(
 	fallback: MetaProviderModel["input"] | undefined,
 ): MetaProviderModel["input"] {
 	if (!modalities)
-		// SAFETY: empty catalog modalities → text-only; union is still text|image in pi-ai 0.83/0.84.
-		return fallback ?? ["text"];
+		// Bare catalog entries (no metadata block) are the common Meta case;
+		// Muse Spark answers image input on them, measured 2026-09-20.
+		return fallback ?? [...DEFAULT_INPUT];
 	const input: MetaProviderModel["input"] = ["text"];
 	if (modalities.includes("image")) input.push("image");
 	return input;
@@ -448,12 +497,15 @@ function modalitiesToInput(
 export function toProviderModels(
 	catalog: CatalogResponse,
 ): MetaProviderModel[] {
+	const seen = new Set<string>();
 	return (catalog.data ?? []).flatMap((entry) => {
 		if (typeof entry.id !== "string" || !entry.id) return [];
+		if (seen.has(entry.id)) return [];
+		seen.add(entry.id);
 		const metadata = entry.metadata?.["muse-code"];
 		if (metadata?.is_hidden) return [];
 		const fallback = FALLBACK_MODELS.find((model) => model.id === entry.id);
-		const catalogName = metadata?.name === entry.id ? undefined : metadata?.name;
+		const catalogName = catalogDisplayName(metadata?.name, entry.id);
 		const variants = metadata?.variants ?? {};
 		const thinkingLevelMap: NonNullable<MetaProviderModel["thinkingLevelMap"]> = {
 			off: null,
@@ -489,7 +541,7 @@ export function toProviderModels(
 					metadata?.limit?.output,
 					fallback?.maxTokens ?? 256_000,
 				),
-				compat: { supportsReasoningEffort: true, supportsToolSearch: true },
+				compat: { ...SPARK_COMPAT },
 			} satisfies MetaProviderModel,
 		];
 	});
@@ -514,13 +566,20 @@ interface CompatibleRefreshContext {
 function providerModelsFromStore(
 	entry: Readonly<ModelsStoreEntry> | undefined,
 ): MetaProviderModel[] {
+	const seen = new Set<string>();
 	return (entry?.models ?? []).flatMap((model: Model<Api>) => {
 		if (model.provider !== META_PROVIDER_ID || model.api !== "openai-responses")
 			return [];
+		if (typeof model.id !== "string" || !model.id || seen.has(model.id)) return [];
+		seen.add(model.id);
+		const name =
+			typeof model.name === "string" && model.name.trim()
+				? model.name.trim()
+				: displayName(model.id);
 		return [
 			{
 				id: model.id,
-				name: model.name,
+				name,
 				api: model.api,
 				baseUrl: model.baseUrl,
 				reasoning: model.reasoning,
@@ -572,6 +631,57 @@ async function persistMetaModels(
 	await context.store?.write(entry);
 }
 
+/**
+ * Fetch the Muse catalog with a key. Shared by the pi-driven refresh path and
+ * the extension's own live discovery pass.
+ */
+export async function fetchMetaCatalog(
+	apiKey: string,
+	fetchImpl: Fetch = fetch,
+	signal?: AbortSignal,
+): Promise<MetaProviderModel[]> {
+	const response = await fetchImpl(META_MODEL_CATALOG_URL, {
+		headers: {
+			Accept: "application/json",
+			Authorization: `Bearer ${apiKey}`,
+			"x-api-version": "1.0.0",
+		},
+		signal,
+	});
+	const body = (await responseBody(response)) as CatalogResponse &
+		Record<string, unknown>;
+	if (!response.ok) {
+		throw new Error(
+			`Meta model catalog failed (HTTP ${response.status})${errorDetail(body) ? `: ${errorDetail(body)}` : ""}`,
+		);
+	}
+	return toProviderModels(body);
+}
+
+function sameModelIds(
+	left: readonly MetaProviderModel[],
+	right: readonly MetaProviderModel[],
+): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((model, index) => model.id === right[index]?.id);
+}
+
+/**
+ * The catalog this process fetched from Meta itself.
+ *
+ * Pi 0.86 runs every in-session refresh with `allowNetwork: false`, and
+ * `composeModelProvider()` then replaces the registered model list with
+ * whatever that offline pass returns. Without this state a stale persisted
+ * catalog silently wins over the bundled fallbacks: `muse-spark-1.3` disappears
+ * from the model list, pi warns "Model not found ... Using custom model id",
+ * and Meta answers HTTP 404 `model_not_found` for a model the key really can
+ * reach. Keeping the live catalog here lets the offline phase republish it.
+ */
+const liveCatalog: {
+	models?: MetaProviderModel[];
+	fetchedAt?: number;
+} = {};
+
 export async function refreshMetaModels(
 	context: RefreshModelsContext,
 	fetchImpl: Fetch = fetch,
@@ -581,7 +691,25 @@ export async function refreshMetaModels(
 	const compatibleContext = context as unknown as CompatibleRefreshContext;
 	if (!context.allowNetwork || context.signal?.aborted) {
 		const cached = await cachedMetaModels(compatibleContext);
-		return cached.length > 0 ? cached : [...FALLBACK_MODELS];
+		const models =
+			liveCatalog.models && liveCatalog.models.length > 0
+				? [...liveCatalog.models]
+				: cached.length > 0
+					? cached
+					: [...FALLBACK_MODELS];
+		// Repair a persisted catalog that predates this process's own fetch, so
+		// `pi update --models` and the next cold start agree with the live ids.
+		if (liveCatalog.models && !sameModelIds(liveCatalog.models, cached)) {
+			try {
+				await persistMetaModels(compatibleContext, {
+					models: modelsForStore(models),
+					checkedAt: liveCatalog.fetchedAt ?? Date.now(),
+				});
+			} catch {
+				// The in-memory catalog stays usable even if persistence fails.
+			}
+		}
+		return models;
 	}
 	const apiKey =
 		context.credential?.type === "oauth"
@@ -595,31 +723,18 @@ export async function refreshMetaModels(
 	}
 
 	try {
-		const response = await fetchImpl(META_MODEL_CATALOG_URL, {
-			headers: {
-				Accept: "application/json",
-				Authorization: `Bearer ${apiKey}`,
-				"x-api-version": "1.0.0",
-			},
-			signal: context.signal,
-		});
-		const body = (await responseBody(response)) as CatalogResponse &
-			Record<string, unknown>;
-		if (!response.ok) {
-			throw new Error(
-				`Meta model catalog failed (HTTP ${response.status})${errorDetail(body) ? `: ${errorDetail(body)}` : ""}`,
-			);
-		}
-		const models = toProviderModels(body);
+		const models = await fetchMetaCatalog(apiKey, fetchImpl, context.signal);
 		if (models.length === 0) {
 			const cached = await cachedMetaModels(compatibleContext);
 			return cached.length > 0 ? cached : [...FALLBACK_MODELS];
 		}
+		liveCatalog.models = models;
+		liveCatalog.fetchedAt = Date.now();
 		if (!context.signal?.aborted) {
 			try {
 				await persistMetaModels(compatibleContext, {
 					models: modelsForStore(models),
-					checkedAt: Date.now(),
+					checkedAt: liveCatalog.fetchedAt,
 				});
 			} catch {
 				// Keep the fresh catalog usable even if persistence fails.
@@ -649,16 +764,21 @@ const PROBE_RETRY_MS = 5 * 60 * 1000;
  * Keys minted through /muse-code/key are not always entitled to encrypted
  * reasoning replay (Meta answers HTTP 400 "reasoning `encrypted_content`
  * was not issued to this caller" when they aren't). Entitlement can change
- * between minted keys, so probe once per key per process instead of
- * hard-coding a decision: requests never 400 and reasoning continuity is
- * kept whenever the key allows it.
+ * between minted keys, so probe once per key and model per process instead of
+ * hard-coding a decision: requests never 400 and reasoning continuity is kept
+ * whenever the key allows it.
+ *
+ * The probe must name a model the key can actually reach. Keys are scoped to
+ * different id sets — a subscription key may expose only internal ids such as
+ * `rl-muse-spark-1-3-sglang-playground` while `muse-spark-1.3` answers HTTP 404
+ * `model_not_found` — so probing a fixed id would read "not entitled" for a key
+ * that is entitled on the model in use.
  */
-interface EntitlementCache {
-	keyHash?: string;
+interface EntitlementState {
 	known?: boolean;
 	lastAttemptAt: number;
 }
-const entitlementCache: EntitlementCache = { lastAttemptAt: 0 };
+const entitlementCache = new Map<string, EntitlementState>();
 
 function apiKeyHash(key: string): string {
 	// Non-cryptographic FNV-1a; only used to key the in-process probe cache.
@@ -670,13 +790,19 @@ function apiKeyHash(key: string): string {
 	return (hash >>> 0).toString(16);
 }
 
+function entitlementKey(apiKey: string, modelId: string): string {
+	return `${apiKeyHash(apiKey)}:${modelId}`;
+}
+
 /**
- * Probe whether the given API key can request reasoning.encrypted_content.
- * Returns true (200), false (Meta rejects the include), or undefined when
- * the probe was inconclusive (transient error) and must be retried later.
+ * Probe whether the given API key can request reasoning.encrypted_content on
+ * `modelId`. Returns true (200), false (Meta rejects the include), or undefined
+ * when the probe was inconclusive (unknown model, transient error) and must be
+ * retried later.
  */
 export async function probeEncryptedReasoningEntitlement(
 	apiKey: string,
+	modelId: string,
 	fetchImpl: Fetch = fetch,
 ): Promise<boolean | undefined> {
 	try {
@@ -689,7 +815,7 @@ export async function probeEncryptedReasoningEntitlement(
 				"x-api-version": "1.0.0",
 			},
 			body: JSON.stringify({
-				model: "muse-spark-1.3",
+				model: modelId,
 				input: "Answer with the single letter: a",
 				include: [ENCRYPTED_REASONING_INCLUDE],
 				max_output_tokens: 16,
@@ -707,28 +833,25 @@ export async function probeEncryptedReasoningEntitlement(
 	}
 }
 
-function scheduleEntitlementProbe(apiKey: string): void {
-	const hash = apiKeyHash(apiKey);
-	if (
-		entitlementCache.keyHash === hash &&
-		entitlementCache.known !== undefined
-	) {
-		return;
-	}
-	if (Date.now() - entitlementCache.lastAttemptAt < PROBE_RETRY_MS) return;
-	entitlementCache.lastAttemptAt = Date.now();
-	void probeEncryptedReasoningEntitlement(apiKey).then((known) => {
-		if (known !== undefined) {
-			entitlementCache.keyHash = hash;
-			entitlementCache.known = known;
-		}
+function scheduleEntitlementProbe(apiKey: string, modelId: string): void {
+	const key = entitlementKey(apiKey, modelId);
+	const cached = entitlementCache.get(key);
+	if (cached?.known !== undefined) return;
+	const now = Date.now();
+	if (cached && now - cached.lastAttemptAt < PROBE_RETRY_MS) return;
+	entitlementCache.set(key, { known: cached?.known, lastAttemptAt: now });
+	void probeEncryptedReasoningEntitlement(apiKey, modelId).then((known) => {
+		if (known === undefined) return;
+		entitlementCache.set(key, { known, lastAttemptAt: Date.now() });
 	});
 }
 
-function keepEncryptedReasoningFor(apiKey: string | undefined): boolean {
-	if (!apiKey) return false;
-	if (entitlementCache.keyHash !== apiKeyHash(apiKey)) return false;
-	return entitlementCache.known === true;
+function keepEncryptedReasoningFor(
+	apiKey: string | undefined,
+	modelId: string | undefined,
+): boolean {
+	if (!apiKey || !modelId) return false;
+	return entitlementCache.get(entitlementKey(apiKey, modelId))?.known === true;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -783,11 +906,97 @@ export function createMetaProviderConfig(): ProviderConfig {
 		refreshModels: refreshMetaModels,
 		oauth: {
 			name: "Meta Model API (browser login or API key)",
+			// Muse access is subscription-backed, matching pi's built-in Meta
+			// provider, so the status bar reports usage as "(sub)".
+			isSubscription: true,
 			login: loginMeta,
 			refreshToken: refreshMetaToken,
 			getApiKey: (credentials: { access: string }) => credentials.access,
 		},
 	};
+}
+
+/**
+ * Live catalog discovery for a running session.
+ *
+ * Pi 0.86 builds its session ModelRuntime without `allowModelNetwork`, and
+ * every in-session refresh runs with `allowNetwork: false`; the only networked
+ * caller, `pi update --models`, does not load extensions at all. Asking pi for
+ * a networked refresh from `session_start` does not help either: pi's startup
+ * fires dozens of offline refreshes, and `Models.beginProviderRefresh()`
+ * supersedes (aborts) an in-flight refresh of the same provider, so an
+ * extension-triggered live pass is silently cancelled before it reaches the
+ * network.
+ *
+ * So the extension fetches the catalog itself with the resolved key, stores it
+ * in `liveCatalog` (which `refreshMetaModels` republishes on every offline
+ * phase, repairing the persisted store), and re-registers the provider with
+ * the fetched models for immediate effect. Fire-and-forget and cooldown-
+ * guarded: startup never blocks on Meta, and a failed fetch leaves the
+ * restored catalog and bundled fallbacks in place.
+ */
+const catalogRefreshState: {
+	lastAttemptAt?: number;
+	inFlight?: Promise<void>;
+} = {};
+
+export function shouldRefreshCatalog(now: number): boolean {
+	if (process.env["PI_OFFLINE"] !== undefined) return false;
+	if (catalogRefreshState.inFlight) return false;
+	// An undefined timestamp means "never attempted", not "attempted at epoch 0".
+	if (catalogRefreshState.lastAttemptAt === undefined) return true;
+	return (
+		now - catalogRefreshState.lastAttemptAt >= CATALOG_REFRESH_COOLDOWN_MS
+	);
+}
+
+export function startLiveCatalogRefresh(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	now: number = Date.now(),
+): Promise<void> | undefined {
+	if (!shouldRefreshCatalog(now)) return undefined;
+	catalogRefreshState.lastAttemptAt = now;
+	const signal = AbortSignal.timeout(CATALOG_REFRESH_TIMEOUT_MS);
+	let tracked: Promise<void>;
+	const run = (async () => {
+		try {
+			const apiKey = (await ctx.modelRegistry?.getProviderAuth(
+				META_PROVIDER_ID,
+			))?.auth?.apiKey;
+			if (!apiKey || signal.aborted) return;
+			const models = await fetchMetaCatalog(apiKey, fetch, signal);
+			if (models.length === 0 || signal.aborted) return;
+			liveCatalog.models = models;
+			liveCatalog.fetchedAt = Date.now();
+			// Re-registration takes effect immediately after binding, and the
+			// offline refresh it kicks republishes and persists the live catalog.
+			pi.registerProvider(META_PROVIDER_ID, {
+				...createMetaProviderConfig(),
+				models,
+			});
+		} catch {
+			// A failed catalog fetch is not fatal: the restored catalog and the
+			// bundled fallbacks stay registered.
+		}
+	})();
+	// Compare against the tracked promise itself: `run.finally(...)` returns a new
+	// promise, so testing `run` would leave the in-flight guard set forever.
+	tracked = run.finally(() => {
+		if (catalogRefreshState.inFlight === tracked) {
+			delete catalogRefreshState.inFlight;
+		}
+	});
+	catalogRefreshState.inFlight = tracked;
+	return tracked;
+}
+
+/** Test seam: drop the cooldown and live catalog so each pass starts clean. */
+export function resetCatalogRefreshState(): void {
+	delete catalogRefreshState.lastAttemptAt;
+	delete catalogRefreshState.inFlight;
+	delete liveCatalog.models;
+	delete liveCatalog.fetchedAt;
 }
 
 export default function metaOAuthProvider(pi: ExtensionAPI): void {
@@ -805,6 +1014,10 @@ export default function metaOAuthProvider(pi: ExtensionAPI): void {
 		process.env["MODEL_API_KEY"] = process.env[META_ENV_VAR];
 	}
 	pi.registerProvider(META_PROVIDER_ID, createMetaProviderConfig());
+	pi.on("session_start", (_event, ctx) => {
+		// Discover the ids this key can actually reach; see startLiveCatalogRefresh.
+		void startLiveCatalogRefresh(pi, ctx);
+	});
 	pi.on("before_provider_request", async (event, ctx) => {
 		if (ctx.model?.provider !== META_PROVIDER_ID) return undefined;
 		let apiKey: string | undefined;
@@ -814,10 +1027,11 @@ export default function metaOAuthProvider(pi: ExtensionAPI): void {
 		} catch {
 			apiKey = undefined;
 		}
-		if (apiKey) scheduleEntitlementProbe(apiKey);
+		const modelId = ctx.model?.id;
+		if (apiKey && modelId) scheduleEntitlementProbe(apiKey, modelId);
 		return applyMetaResponsesCacheHints(
 			event.payload,
-			keepEncryptedReasoningFor(apiKey),
+			keepEncryptedReasoningFor(apiKey, modelId),
 		);
 	});
 }

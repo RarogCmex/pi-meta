@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 
 import type {
 	ModelsStoreEntry,
@@ -14,6 +14,7 @@ import {
 	mintMetaApiKey,
 	refreshMetaModels,
 	refreshMetaToken,
+	resetCatalogRefreshState,
 	STATIC_API_KEY_PREFIX,
 	toProviderModels,
 } from "../extensions/meta.ts";
@@ -45,6 +46,13 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("Meta OAuth provider", () => {
+	// refreshMetaModels now keeps a process-wide liveCatalog so the offline
+	// phase republishes ids this process actually fetched. Reset it between
+	// tests so store-restore assertions see only their own fixture.
+	beforeEach(() => {
+		resetCatalogRefreshState();
+	});
+
 	test("maps the Muse catalog into Pi model metadata", () => {
 		const models = toProviderModels({
 			data: [
@@ -74,7 +82,11 @@ describe("Meta OAuth provider", () => {
 			maxTokens: 45_000,
 			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 			thinkingLevelMap: { off: null, high: "deep", max: null },
-			compat: { supportsReasoningEffort: true, supportsToolSearch: true },
+			compat: {
+				supportsLongCacheRetention: true,
+				supportsStrictMode: true,
+				supportsToolSearch: false,
+			},
 		});
 	});
 
@@ -444,7 +456,12 @@ describe("Meta OAuth provider", () => {
 		expect(credentials.refresh).toBe("identity-token");
 	});
 
-	liveCatalogTest("live catalog IDs have bundled fallbacks", async () => {
+	// Live-endpoint drift, observed 2026-09-20: a subscription key can expose
+	// only internal ids (`rl-muse-spark-1-3-sglang-playground`, `goofy_glacier135`,
+	// …) and answer 404 model_not_found for the public `muse-spark-*` ids. So the
+	// live set is not expected to intersect the bundled fallbacks; what matters is
+	// that every live id maps to a usable model.
+	liveCatalogTest("live catalog ids all map to usable models", async () => {
 		if (!liveApiKey) throw new Error("PI_META_LIVE_API_KEY is required");
 		const response = await fetch(META_MODEL_CATALOG_URL, {
 			headers: {
@@ -457,35 +474,62 @@ describe("Meta OAuth provider", () => {
 			throw new Error(`Meta model catalog failed (HTTP ${response.status})`);
 		}
 		const body = (await response.json()) as {
-			data?: Array<{ id?: unknown }>;
+			data?: Array<{ id?: string }>;
 		};
 		const liveIDs = (body.data ?? []).flatMap((entry) =>
 			typeof entry.id === "string" && entry.id ? [entry.id] : [],
 		);
-		const fallbackIDs = new Set(
-			(createMetaProviderConfig().models ?? []).map(
-				(model: MetaProviderModel) => model.id,
-			),
-		);
 
 		expect(liveIDs).not.toHaveLength(0);
-		expect(liveIDs.filter((id) => !fallbackIDs.has(id))).toEqual([]);
+		const models = toProviderModels(body);
+		expect(models.map((model) => model.id)).toEqual(liveIDs);
+		for (const model of models) {
+			expect(model.input).toEqual(["text", "image"]);
+			expect(model.contextWindow).toBeGreaterThan(0);
+			expect(model.maxTokens).toBeGreaterThan(0);
+		}
 	});
 
-	test("enables tool search for fallback models", () => {
-		const models = createMetaProviderConfig().models ?? [];
+	// Measured 2026-09-20 against api.meta.ai/v1/responses: a tool announced
+	// only through tool_search_call/tool_search_output items is never called,
+	// while the same tool in `tools` is. Meta accepts and ignores those items,
+	// so claiming support silently drops mid-conversation tool additions.
+	test("keeps tool search off so pi always sends the full tool list", () => {
+		const models = [
+			...(createMetaProviderConfig().models ?? []),
+			...toProviderModels({ data: [{ id: "muse-spark-catalogued" }] }),
+		];
 
 		expect(models).not.toHaveLength(0);
-		expect(
-			models.every((model: MetaProviderModel) => {
-				const compat = model.compat as { supportsToolSearch?: boolean } | undefined;
-				return (
-					compat !== undefined &&
-					"supportsToolSearch" in compat &&
-					compat.supportsToolSearch === true
-				);
-			}),
-		).toBe(true);
+		for (const model of models) {
+			const compat = model.compat as
+				| { supportsToolSearch?: boolean; supportsStrictMode?: boolean }
+				| undefined;
+			expect(compat?.supportsToolSearch).toBe(false);
+			// Pi 0.86 enables strict-prefer JSON-schema sampling for read/bash/
+			// edit/write by default; Meta accepts strict tools once the schema
+			// carries additionalProperties:false, which pi's converter adds.
+			expect(compat?.supportsStrictMode).toBe(true);
+		}
+	});
+
+	// Meta accepts max_output_tokens up to 256k on Spark ids and answers image
+	// input on bare catalog entries too, so both stay advertised.
+	test("keeps long prompt-cache retention and vision on every model", () => {
+		const models = [
+			...(createMetaProviderConfig().models ?? []),
+			...toProviderModels({ data: [{ id: "muse-spark-catalogued" }] }),
+		];
+		for (const model of models) {
+			const compat = model.compat as
+				| { supportsLongCacheRetention?: boolean }
+				| undefined;
+			expect(compat?.supportsLongCacheRetention).toBe(true);
+			expect(model.input).toEqual(["text", "image"]);
+			// Meta never echoes the retention it applied, so pi 0.86's cache
+			// warming would only guess a cadence from promptCache lifetimes.
+			expect(model.promptCache).toBeUndefined();
+		}
 	});
 
 	test("runs device login, polls, and mints a Model API key", async () => {

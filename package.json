@@ -1,6 +1,6 @@
 {
   "name": "pi-meta-oauth",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Meta Model API OAuth provider for pi",
   "keywords": [
     "pi-package",
@@ -31,12 +31,12 @@
     "image": "https://raw.githubusercontent.com/BlockedPath/pi-meta-oauth/main/preview.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.83.0 <0.86.0",
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.86.0"
+    "@earendil-works/pi-ai": ">=0.83.0 <0.87.0",
+    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.87.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.86.1",
     "bun-types": "latest",
     "typescript": "^5.9.0"
   },

@@ -7,15 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
 ### Added
 
-- `muse-spark-1.3` support: shared `sparkModel()` fallbacks, video/audio input advertisement, and thinking `max` → `max` on standard 1.3 (upstream PR #14).
-- Per-key entitlement probe for `reasoning.encrypted_content`; the include is stripped for keys Meta rejects, so cross-turn reasoning never 400s (upstream PR #18).
-- API-key identification: `/login meta` offers a method choice between the browser device flow and pasting a Model API key. Pasted keys are validated against `GET /v1/models`, stored with a `static-api-key:` refresh marker, and passed through unchanged by the daily refresh.
+- Pi 0.86.x support: peer range `>=0.83.0 <0.87.0`, devDeps 0.86.1, `TranscriptContext`-branded stream tests.
+- Live catalog self-discovery on `session_start`: pi 0.86 runs all in-session refreshes with `allowNetwork: false` (and its startup refresh storm supersedes extension-triggered live passes), so the extension now fetches `GET /v1/models` itself with the resolved key and re-registers the provider with the fetched ids. This is what makes keys whose catalog exposes only account-specific ids (e.g. `rl-muse-spark-1-3-sglang-playground`) work at all — pi's built-in Meta provider ships a static `muse-spark-*` catalog and answers HTTP 404 `model_not_found` for such keys.
+- `compat.supportsStrictMode: true` on every Muse model: pi 0.86 enables strict-prefer JSON-schema sampling for `read`/`bash`/`edit`/`write` by default, and Meta accepts strict tools once the schema carries `additionalProperties: false` (measured 2026-09-20).
+- `oauth.isSubscription: true`, matching pi's built-in provider so usage renders as "(sub)".
+- Entitlement probe for `reasoning.encrypted_content` is now keyed per (key, model) and names the model actually in use; a fixed probe id would read 404 `model_not_found` as "not entitled" for account-scoped keys.
 
 ### Changed
 
-- Support pi 0.85.x: peer range `>=0.83.0 <0.86.0`, devDeps 0.85.1, legacy-shape test casts (upstream PR #18).
+- `compat.supportsToolSearch: false`: Meta accepts `tool_search_call`/`tool_search_output` items but ignores them — a tool announced only through them is never called, while the same tool in `tools` is (measured 2026-09-20). With tool search off, pi always sends the full current tool list, including tools added mid-conversation.
+- Bare catalog entries (no `metadata["muse-code"]` block) now default to `input: ["text", "image"]` instead of text-only: Muse Spark answers image input on bare account-scoped ids (measured 2026-09-20).
+- Offline refresh phases republish and persist the process's own live catalog, repairing a stale `models-store.json` written by pi's built-in static provider (`pi update --models` does not load extensions).
+- Live test probes resolve the credential from `auth.meta.key` (api-key shape) as well as `auth.meta.access` (oauth shape), and pick the cache-probe model from the live catalog.
+
+### Fixed
+
+- Catalog mapping deduplicates ids, tolerates blank/whitespace display names, and normalizes `displayName()` separators (uncommitted work from the previous session, now covered by tests).
+- `muse-spark-1.3` fallback maps thinking `max` → `max`, standard 1.3 being the only Spark that does (upstream PR #14).
+- Per-key entitlement probe for `reasoning.encrypted_content`; the include is stripped for keys Meta rejects, so cross-turn reasoning never 400s (upstream PR #18).
+- API-key identification: `/login meta` offers a method choice between the browser device flow and pasting a Model API key. Pasted keys are validated against `GET /v1/models`, stored with a `static-api-key:` refresh marker, and passed through unchanged by the daily refresh.
 
 ## [0.6.1] - 2026-09-04
 
