@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Transparent retry of transient Meta failures at the provider seam: `createMetaProviderConfig()` now registers `streamSimple`, which re-issues the same context and options for gateway/5xx/overload errors (up to 3 retries, 2s→4s→8s backoff capped at 30s) so the model never sees a failed turn or a retry nudge. Mirrors `pi-nvidia-plus`'s transport-level retry without an undici dispatcher.
+- Exhaustion delivers the original error byte-for-byte; retries and give-ups are surfaced as pi notifications when a UI is present. Disable with `META_TRANSPORT_RETRY=0`.
+- Non-transient failures fail fast and are never re-sent: `reasoning.encrypted_content` denials, `model_not_found`, auth, quota/billing (`insufficient_quota`, `GoUsageLimitError`, `out of budget`), content filters, bad requests, and context overflow.
+- An attempt that already delivered content to pi is never replayed, so a partial answer is surfaced unchanged rather than duplicated.
+- Learning from terminal errors: an `encrypted_content` denial marks the (key, model) as unentitled so later requests strip the include, and a `model_not_found` turn kicks a cooldown-guarded live-catalog repair.
+- Wire-level retry coverage in `tests/meta-retry.test.ts` (scripted inner Responses implementation, no network), including the measured 504 `gateway_timeout` body.
+
 ## [0.7.0] - 2026-09-20
 
 ### Added

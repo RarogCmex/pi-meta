@@ -11,6 +11,15 @@ import type {
 	ExtensionContext,
 	ProviderConfig,
 } from "@earendil-works/pi-coding-agent";
+import {
+	createAssistantMessageEventStream,
+	isContextOverflow,
+	isRetryableAssistantError,
+	openAIResponsesApi,
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
+} from "@earendil-works/pi-ai/compat";
 
 export const META_PROVIDER_ID = "meta";
 export const META_API_BASE_URL = "https://api.meta.ai/v1";
@@ -896,6 +905,471 @@ export function applyMetaResponsesCacheHints(
 	return body;
 }
 
+/* ------------------------------------------------------------------ */
+/* Transparent retry of transient Meta failures                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Meta's gateway answers a flooded or slow request with HTTP 5xx — most often
+ * 504 `gateway_timeout` ("The response stream did not start before the server
+ * timeout") — which pi-ai folds into a terminal `stopReason: "error"` turn.
+ * Pi's provider retry runs with `retry.provider.maxRetries` (often 0) and the
+ * agent-level retry is visible to the model through retry extensions, so a
+ * short gateway hiccup used to surface as a failed turn and a visible
+ * "Retry the previous request." message.
+ *
+ * This layer sits *below* pi, at the provider seam: `streamSimple` re-issues
+ * the same context and options until a usable stream starts, and pi only ever
+ * sees the final outcome. It mirrors pi-nvidia-plus's transparent transport
+ * retry, with the provider seam as the transport (no undici dispatcher, no
+ * extra runtime dependency).
+ *
+ * Safety rules, in order:
+ * - once the attempt committed content to pi, it can never be replayed, so a
+ *   failure after that point is surfaced verbatim (same bytes as today);
+ * - aborted turns are terminal and never retried;
+ * - context overflow is recovered by compaction, not by re-sending;
+ * - non-transient text (`encrypted_content`, `model_not_found`, auth, quota,
+ *   billing, content filters, bad requests) fails fast — checked BEFORE the
+ *   retryable catalog so a `429 insufficient_quota` is not re-sent;
+ * - otherwise pi-ai's own `isRetryableAssistantError` catalog plus Meta/gateway
+ *   wordings decides.
+ *
+ * Bounded exponential backoff (`minDelayMs * 2^(attempt-1)`, capped), abortable
+ * during the wait. On exhaustion pi receives the *original* error, so behavior
+ * without the layer is preserved. `META_TRANSPORT_RETRY=0` disables it.
+ */
+export interface MetaRetryConfig {
+	/** Retries after the first attempt. */
+	maxRetries: number;
+	/** First backoff delay; doubled per attempt. */
+	minDelayMs: number;
+	/** Backoff ceiling. */
+	maxDelayMs: number;
+}
+
+export const DEFAULT_META_RETRY: MetaRetryConfig = {
+	maxRetries: 3,
+	minDelayMs: 2_000,
+	maxDelayMs: 30_000,
+};
+
+/** `META_TRANSPORT_RETRY=0|false|no|off` disables the transparent retry layer. */
+export function metaTransportRetryEnabled(
+	env: Record<string, string | undefined> = process.env,
+): boolean {
+	const raw = env["META_TRANSPORT_RETRY"]?.trim().toLowerCase();
+	return !(raw === "0" || raw === "false" || raw === "no" || raw === "off");
+}
+
+/** Flat-then-exponential backoff with a hard ceiling. */
+export function metaRetryDelayMs(
+	attempt: number,
+	config: MetaRetryConfig,
+): number {
+	const delay = config.minDelayMs * 2 ** Math.max(0, attempt - 1);
+	const safe = Number.isSafeInteger(delay) ? delay : config.maxDelayMs;
+	return Math.min(safe, config.maxDelayMs);
+}
+
+/**
+ * Non-transient failures win over every retryable pattern: a 429 that means
+ * "billing exhausted" or a deterministic 400/404 must not be re-sent.
+ */
+const META_NON_RETRYABLE_RE =
+	/encrypted_content|model_?not_?found|invalid_api_key|unauthoriz|forbidden|permission|denied|authenticat|billing|insufficient|quota exceeded|out of budget|content.?filter|moderation|context.?(length|window)|exceeds.{0,24}(context|maximum)|too long|bad request|malformed|unsupported|not.?(found|supported)|deprecated/i;
+
+/** Meta/gateway wordings pi-ai's transient catalog does not cover yet. */
+const META_RETRYABLE_RE =
+	/gateway_?timeout|did not start before the server timeout|response stream did not start|resource_?exhausted|overload|temporaril|too many requests|try again|try your request|service.?unavailable|high demand/i;
+
+/** Classifies a terminal assistant message as a transparently retryable failure. */
+export function isRetryableMetaError(
+	message: AssistantMessage,
+	contextWindow?: number,
+): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Overflow is recovered by compaction, never by re-sending the same context.
+	if (isContextOverflow(message, contextWindow)) return false;
+	if (META_NON_RETRYABLE_RE.test(message.errorMessage)) return false;
+	if (isRetryableAssistantError(message)) return true;
+	return META_RETRYABLE_RE.test(message.errorMessage);
+}
+
+type MetaStreamSimple = NonNullable<ProviderConfig["streamSimple"]>;
+type MetaStreamModel = Parameters<MetaStreamSimple>[0];
+type MetaStreamContext = Parameters<MetaStreamSimple>[1];
+type MetaStreamOptions = Parameters<MetaStreamSimple>[2];
+
+/** The Responses implementation, structurally typed to survive pi 0.83→0.86 drift. */
+export interface MetaInnerApi {
+	streamSimple(
+		model: MetaStreamModel,
+		context: MetaStreamContext,
+		options?: MetaStreamOptions,
+	): AssistantMessageEventStream;
+}
+
+let cachedInnerApi: MetaInnerApi | undefined;
+function metaInnerApi(): MetaInnerApi {
+	// `openAIResponsesApi()` is a lazy wrapper; cache it, but keep it injectable.
+	return (cachedInnerApi ??= openAIResponsesApi() as unknown as MetaInnerApi);
+}
+
+type MetaNotifier = (message: string, type: "info" | "warning" | "error") => void;
+
+/**
+ * Session-scoped side channels for the retry layer: user notifications and the
+ * live-catalog repair hook, both bound in `session_start`. Absent in headless
+ * runs and tests, where they are simply not called.
+ */
+const metaStreamState: {
+	notify?: MetaNotifier;
+	refreshCatalog?: () => void;
+} = {};
+
+/** Binds (or clears) the session side channels; called from `session_start`. */
+export function bindMetaStreamState(hooks: {
+	notify?: MetaNotifier;
+	refreshCatalog?: () => void;
+}): void {
+	metaStreamState.notify = hooks.notify;
+	metaStreamState.refreshCatalog = hooks.refreshCatalog;
+}
+
+/** Test seam: drop session bindings and the exhaustion-notification dedupe. */
+export function resetMetaStreamState(): void {
+	bindMetaStreamState({});
+	retryExhaustedNotified.clear();
+}
+
+/** Learned per (key, model): has this key been rejected for `reasoning.encrypted_content`? */
+export function encryptedReasoningEntitlement(
+	apiKey: string,
+	modelId: string,
+): boolean | undefined {
+	return entitlementCache.get(entitlementKey(apiKey, modelId))?.known;
+}
+
+/**
+ * Learn from a terminal Meta failure so the *next* request is not set up to
+ * fail the same way:
+ * - `reasoning.encrypted_content was not issued to this caller` → remember the
+ *   key/model as not entitled, so the include is stripped from now on;
+ * - `model_not_found` → the registered catalog drifted from the key's real
+ *   ids; kick a background live-catalog repair (cooldown-guarded).
+ */
+export function learnFromMetaError(
+	text: string,
+	modelId: string,
+	apiKey?: string,
+): void {
+	if (!text) return;
+	if (apiKey && text.includes("encrypted_content")) {
+		entitlementCache.set(entitlementKey(apiKey, modelId), {
+			known: false,
+			lastAttemptAt: Date.now(),
+		});
+	}
+	if (/model_?not_?found|"code"\s*:\s*"model/i.test(text)) {
+		metaStreamState.refreshCatalog?.();
+	}
+}
+
+interface MetaAttemptFailure {
+	kind: "error";
+	message: AssistantMessage;
+	/** Uncommitted events (the `start` event, usually) to flush when giving up. */
+	pending: AssistantMessageEvent[];
+	/** True once content reached pi: the attempt can no longer be replayed. */
+	committed: boolean;
+}
+
+type MetaAttempt = { kind: "committed" } | MetaAttemptFailure;
+
+function emptyUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function metaErrorMessage(model: MetaStreamModel, error: unknown): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: emptyUsage(),
+		stopReason: "error",
+		errorMessage: error instanceof Error ? error.message : String(error),
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * One attempt. Events are buffered until the first content-bearing event: that
+ * is what distinguishes "the gateway never started the stream, retry is safe"
+ * from "tokens already reached pi". A happy stream therefore keeps its full
+ * flow — only the first content event is delayed by one event — and pi never
+ * sees a discarded attempt.
+ */
+async function runMetaAttempt(
+	outer: AssistantMessageEventStream,
+	inner: MetaInnerApi,
+	model: MetaStreamModel,
+	context: MetaStreamContext,
+	options: MetaStreamOptions,
+): Promise<MetaAttempt> {
+	const pending: AssistantMessageEvent[] = [];
+	let committed = false;
+	const emit = (event: AssistantMessageEvent): void => {
+		if (committed) outer.push(event);
+		else pending.push(event);
+	};
+	const commit = (): void => {
+		if (committed) return;
+		committed = true;
+		while (pending.length > 0) {
+			outer.push(pending.shift() as AssistantMessageEvent);
+		}
+	};
+
+	let terminal = false;
+	for await (const event of inner.streamSimple(model, context, options)) {
+		if (event.type === "done") {
+			terminal = true;
+			emit(event);
+			commit();
+			continue;
+		}
+		if (event.type === "error") {
+			return { kind: "error", message: event.error, pending, committed };
+		}
+		if (event.type === "start") {
+			// `start` carries no content; hold it so a discarded attempt leaves no
+			// stray partial assistant message in pi's transcript.
+			emit(event);
+			continue;
+		}
+		// First content-bearing event: the response now belongs to pi.
+		emit(event);
+		commit();
+	}
+	if (!terminal) {
+		return {
+			kind: "error",
+			message: metaErrorMessage(
+				model,
+				new Error("Meta stream ended without a terminal event"),
+			),
+			pending,
+			committed,
+		};
+	}
+	commit();
+	return { kind: "committed" };
+}
+
+/** Abortable backoff; resolves true when the wait was cut short by the signal. */
+function interruptibleRetrySleep(
+	delayMs: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) {
+			resolve(true);
+			return;
+		}
+		const onAbort = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(true);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve(false);
+		}, delayMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+const retryExhaustedNotified = new Map<string, number>();
+
+function briefMetaError(message: string | undefined, maxChars = 160): string {
+	const text = (message ?? "unknown error").replace(/\s+/g, " ").trim();
+	return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
+function notifyRetryExhausted(info: {
+	attempts: number;
+	errorMessage: string;
+}): void {
+	const key = briefMetaError(info.errorMessage);
+	const now = Date.now();
+	const last = retryExhaustedNotified.get(key);
+	if (last !== undefined && now - last < 60_000) return;
+	// The map only exists to dedupe; never let it grow without bound.
+	if (retryExhaustedNotified.size >= 64) {
+		for (const [entry, at] of retryExhaustedNotified) {
+			if (now - at >= 600_000) retryExhaustedNotified.delete(entry);
+		}
+		if (retryExhaustedNotified.size >= 64) retryExhaustedNotified.clear();
+	}
+	retryExhaustedNotified.set(key, now);
+	metaStreamState.notify?.(
+		`pi-meta: giving up after ${info.attempts} attempts — ${briefMetaError(info.errorMessage, 240)}`,
+		"warning",
+	);
+}
+
+export interface MetaStreamRetryDeps {
+	/** Inner Responses implementation; injectable for tests. */
+	inner?: MetaInnerApi;
+	/** Backoff sleep; resolves true when the signal aborted the wait. */
+	sleep?: (delayMs: number, signal?: AbortSignal) => Promise<boolean>;
+	config?: MetaRetryConfig;
+	enabled?: boolean;
+	env?: Record<string, string | undefined>;
+	/** A retry was scheduled (1-based retry number). */
+	onRetryScheduled?: (info: {
+		attempt: number;
+		maxAttempts: number;
+		delayMs: number;
+		errorMessage: string;
+	}) => void;
+	/** The retry budget is spent and pi is about to receive the error. */
+	onRetryExhausted?: (info: { attempts: number; errorMessage: string }) => void;
+}
+
+/**
+ * The transparent-retry `streamSimple` handler. Never rejects and never throws
+ * synchronously: every outcome ends the returned stream with a terminal event,
+ * so pi's stream contract is preserved even if the inner API misbehaves.
+ */
+export function streamMetaSimple(
+	model: MetaStreamModel,
+	context: MetaStreamContext,
+	options?: MetaStreamOptions,
+	deps: MetaStreamRetryDeps = {},
+): AssistantMessageEventStream {
+	const outer = createAssistantMessageEventStream();
+	const inner = deps.inner ?? metaInnerApi();
+	const config = deps.config ?? DEFAULT_META_RETRY;
+	const enabled = deps.enabled ?? metaTransportRetryEnabled(deps.env);
+	const sleep = deps.sleep ?? interruptibleRetrySleep;
+
+	const deliverFailure = (
+		failure: MetaAttemptFailure,
+		reason: "error" | "aborted",
+		message: AssistantMessage = failure.message,
+	): void => {
+		for (const event of failure.pending) outer.push(event);
+		outer.push({ type: "error", reason, error: message });
+		outer.end();
+	};
+
+	void (async () => {
+		for (let attempt = 1; ; attempt++) {
+			let result: MetaAttempt;
+			try {
+				result = await runMetaAttempt(outer, inner, model, context, options);
+			} catch (error) {
+				// The inner API must fold its own throws into error events; keep the
+				// stream contract anyway instead of leaving pi waiting forever.
+				const aborted = options?.signal?.aborted === true;
+				const message = metaErrorMessage(model, error);
+				if (aborted) {
+					delete message.errorMessage;
+					message.stopReason = "aborted";
+				} else {
+					learnFromMetaError(message.errorMessage ?? "", model.id, options?.apiKey);
+				}
+				outer.push({
+					type: "error",
+					reason: aborted ? "aborted" : "error",
+					error: message,
+				});
+				outer.end();
+				return;
+			}
+			if (result.kind === "committed") {
+				outer.end();
+				return;
+			}
+
+			const failure = result.message;
+			const errorText = failure.errorMessage ?? "";
+			learnFromMetaError(errorText, model.id, options?.apiKey);
+
+			const retryable =
+				enabled &&
+				!options?.signal?.aborted &&
+				!result.committed &&
+				attempt <= config.maxRetries &&
+				isRetryableMetaError(failure, model.contextWindow);
+			if (!retryable) {
+				deliverFailure(
+					result,
+					failure.stopReason === "aborted" ? "aborted" : "error",
+				);
+				if (attempt > 1) {
+					deps.onRetryExhausted?.({ attempts: attempt, errorMessage: errorText });
+				}
+				return;
+			}
+
+			const delayMs = metaRetryDelayMs(attempt, config);
+			deps.onRetryScheduled?.({
+				attempt,
+				maxAttempts: config.maxRetries,
+				delayMs,
+				errorMessage: errorText,
+			});
+			if (await sleep(delayMs, options?.signal)) {
+				// Mirrors pi's own retry loop: an abort during the backoff is reported
+				// as an aborted turn, not as the transient failure that triggered it.
+				const { errorMessage: _dropped, ...rest } = failure;
+				deliverFailure(result, "aborted", { ...rest, stopReason: "aborted" });
+				return;
+			}
+		}
+	})();
+
+	return outer;
+}
+
+/**
+ * Provider-config handler binding the retry layer to session notifications.
+ * `deps` exists only as a test seam: production callers pass nothing.
+ */
+export function createMetaStreamSimple(
+	deps: MetaStreamRetryDeps = {},
+): MetaStreamSimple {
+	return (model, context, options) =>
+		streamMetaSimple(model, context, options, {
+			...deps,
+			onRetryScheduled: (info) => {
+				deps.onRetryScheduled?.(info);
+				if (!metaStreamState.notify) return;
+				const seconds = Math.max(1, Math.round(info.delayMs / 1000));
+				metaStreamState.notify(
+					`pi-meta: transient Meta failure, retrying in ${seconds}s (retry ${info.attempt}/${info.maxAttempts}): ${briefMetaError(info.errorMessage)}`,
+					"info",
+				);
+			},
+			onRetryExhausted: (info) => {
+				deps.onRetryExhausted?.(info);
+				notifyRetryExhausted(info);
+			},
+		});
+}
+
 export function createMetaProviderConfig(): ProviderConfig {
 	return {
 		name: "Meta Model API",
@@ -903,6 +1377,7 @@ export function createMetaProviderConfig(): ProviderConfig {
 		api: "openai-responses",
 		apiKey: "$META_API_KEY",
 		models: [...FALLBACK_MODELS],
+		streamSimple: createMetaStreamSimple(),
 		refreshModels: refreshMetaModels,
 		oauth: {
 			name: "Meta Model API (browser login or API key)",
@@ -1015,6 +1490,16 @@ export default function metaOAuthProvider(pi: ExtensionAPI): void {
 	}
 	pi.registerProvider(META_PROVIDER_ID, createMetaProviderConfig());
 	pi.on("session_start", (_event, ctx) => {
+		bindMetaStreamState({
+			// Headless runs have no UI; notifications are simply skipped there.
+			...(ctx.hasUI
+				? { notify: (message: string, type: "info" | "warning" | "error") => ctx.ui.notify(message, type) }
+				: {}),
+			// A `model_not_found` turn lets the retry layer repair the registered ids.
+			refreshCatalog: () => {
+				void startLiveCatalogRefresh(pi, ctx);
+			},
+		});
 		// Discover the ids this key can actually reach; see startLiveCatalogRefresh.
 		void startLiveCatalogRefresh(pi, ctx);
 	});

@@ -41,6 +41,45 @@ Wire compatibility (measured 2026-09-20 against `api.meta.ai/v1/responses`):
 
 Hermetic OAuth and catalog tests live in `tests/meta.test.ts`.
 
+## Transparent error handling
+
+`api.meta.ai` answers a flooded or slow request with HTTP 5xx — most often 504
+`gateway_timeout` ("The response stream did not start before the server
+timeout") — and pi-ai folds that into a terminal `stopReason: "error"` turn.
+Pi's provider retry runs with `retry.provider.maxRetries` (often 0), and the
+agent-level retry is visible to the model through retry extensions, so a short
+gateway hiccup used to surface as a failed turn plus a model-visible
+"Retry the previous request." message.
+
+The extension absorbs that class of error at the provider seam, the same way
+`pi-nvidia-plus` does at the undici transport: `createMetaProviderConfig()`
+registers `streamSimple`, which re-issues the same context and options until a
+usable stream starts, and pi only ever sees the final outcome. No undici
+dispatcher, no extra runtime dependency.
+
+- `isRetryableMetaError()` — non-transient text is checked FIRST
+  (`encrypted_content`, `model_not_found`, auth, quota/billing, content filters,
+  bad requests, context overflow), then pi-ai's `isRetryableAssistantError`
+  catalog, then Meta/gateway wordings (`gateway_timeout`, `did not start before
+  the server timeout`, `ResourceExhausted`, overload).
+- An attempt that already delivered content to pi is never replayed: events are
+  buffered until the first content-bearing one, so a failed 504 (which never
+  starts the stream) is invisible in the transcript and a partial answer is
+  surfaced unchanged.
+- Backoff is exponential (`minDelayMs * 2^(attempt-1)`, cap `maxDelayMs`) and
+  abortable during the wait; an abort there is reported as an aborted turn.
+- On exhaustion pi gets the original error byte-for-byte, so behavior without
+  the layer is preserved. `META_TRANSPORT_RETRY=0` disables it entirely.
+- Two learnings ride along: an `encrypted_content` denial marks the (key, model)
+  as unentitled so later requests strip the include, and a `model_not_found`
+  turn kicks a cooldown-guarded live-catalog repair.
+
+Wire-level, end-to-end retry coverage lives in `tests/meta-retry.test.ts`
+(scripted inner Responses implementation, no network). It asserts the measured
+504 body is absorbed, the original error survives exhaustion, content-bearing
+attempts are never replayed, quota 429s and overflow never retry, and the
+stream contract holds when the inner API throws.
+
 ## Prompt caching
 
 Muse Spark on `api.meta.ai` returns no useful cache hits on `/v1/chat/completions`. Keep the provider on `/v1/responses` and preserve `applyMetaResponsesCacheHints()` in the `before_provider_request` hook. It sets `prompt_cache_retention: "24h"` only when the payload has no explicit retention and removes `reasoning` when effort is `"none"` or missing because Meta rejects that shape.

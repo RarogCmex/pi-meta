@@ -13,6 +13,7 @@ Meta Model API OAuth for [pi](https://pi.dev).
 - Device authorization against `https://auth.meta.com`
 - Model API-key minting through `POST https://api.meta.ai/muse-code/key`
 - Live Muse catalog discovery from `GET https://api.meta.ai/v1/models` on session start, so account-specific model ids work too
+- Transparent retry of transient Meta gateway failures (504 `gateway_timeout`, overload, 5xx) below pi — the model never sees a retry nudge
 - Strict JSON-schema tool sampling and subscription-aware usage reporting, matching pi 0.86's built-in Meta provider
 
 Pi 0.86 added a built-in Meta provider, but it ships a static `muse-spark-*`
@@ -85,6 +86,53 @@ with `max_output_tokens: 16`, naming the model actually in use — and:
 The probe runs in the background on the first request for a given key and is
 recached when the daily key rotation delivers a new key. If Meta changes
 entitlement policy, a restart (or daily key rotation) picks it up.
+
+## Transparent error handling
+
+Meta's gateway answers a flooded or slow request with HTTP 5xx — most often
+504 `gateway_timeout` ("The response stream did not start before the server
+timeout") — which pi-ai turns into a terminal error turn:
+
+```text
+Error: meta API error (504): {"code":"gateway_timeout","message":"The response stream did not start before the server timeout.","param":null,"type":"server_error"}
+```
+
+Pi's provider retry runs with `retry.provider.maxRetries` (often 0), and the
+agent-level retry is model-visible through retry extensions, so a short gateway
+hiccup used to surface as a failed turn and a "Retry the previous request."
+message the model mistakes for a real instruction.
+
+The extension absorbs that class of error at the provider seam — the same
+approach `pi-nvidia-plus` takes at the undici transport. `streamSimple`
+re-issues the same context and options until a usable stream starts, and pi only
+ever sees the final outcome.
+
+What is retried:
+
+- 5xx and gateway/upstream failures, `gateway_timeout`, "did not start before
+the server timeout", overload/`ResourceExhausted`, rate limits (pi-ai's
+transient catalog plus Meta wordings).
+
+What is never retried:
+
+- anything after content already reached pi (the partial answer is surfaced
+unchanged, so nothing is duplicated);
+- aborted turns;
+- context overflow (compaction handles it);
+- deterministic failures: `reasoning.encrypted_content` denials,
+`model_not_found`, auth, quota/billing (`insufficient_quota`,
+`GoUsageLimitError`, `out of budget`), content filters, bad requests.
+
+Up to 3 retries with exponential backoff (2s → 4s → 8s, capped at 30s),
+abortable during the wait with `Esc` (reported as an aborted turn). On
+exhaustion pi receives the original error unchanged. Retries and exhaustion are
+surfaced as pi notifications when a UI is present.
+
+Two learnings ride along: an `encrypted_content` denial marks the key/model as
+unentitled so later requests strip the include, and a `model_not_found` turn
+kicks a cooldown-guarded live-catalog repair.
+
+Disable with `META_TRANSPORT_RETRY=0` (also `false`, `no`, `off`).
 
 ## Models
 
