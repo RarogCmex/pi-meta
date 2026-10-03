@@ -31,12 +31,12 @@
     "image": "https://raw.githubusercontent.com/BlockedPath/pi-meta-oauth/main/preview.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.83.0 <0.87.0",
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.87.0"
+    "@earendil-works/pi-ai": ">=0.83.0 <2.0.0",
+    "@earendil-works/pi-coding-agent": ">=0.83.0 <2.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.86.1",
-    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "bun-types": "latest",
     "typescript": "^5.9.0"
   },
