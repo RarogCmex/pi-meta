@@ -359,6 +359,51 @@ describe("Meta OAuth provider", () => {
 		expect("provider" in models[0]).toBe(false);
 	});
 
+	// pi 1.0.0 widened the persisted store entry to `readonly AnyModel[]`
+	// ("persisted models of every type"). A chat-only provider must not re-serve
+	// an image row as a chat model: it has no reasoning/contextWindow/maxTokens,
+	// so the copied fields would be undefined and the id would land in /model
+	// anyway. Mutation control: removing the `isModelType(model, "chat")` guard in
+	// `providerModelsFromStore` turns this test red (2 ids instead of 1).
+	test("drops non-chat rows from the Pi 1.0 mixed store snapshot", async () => {
+		const fallback = (createMetaProviderConfig().models ?? [])[0];
+		if (!fallback) throw new Error("Meta fallback model is required");
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			stored: {
+				models: [
+					{
+						...fallback,
+						provider: META_PROVIDER_ID,
+						api: "openai-responses" as const,
+						baseUrl: META_API_BASE_URL,
+						type: "chat" as const,
+					},
+					{
+						id: "muse-image-1",
+						name: "Muse Image 1",
+						provider: META_PROVIDER_ID,
+						api: "openai-responses" as const,
+						baseUrl: META_API_BASE_URL,
+						type: "image" as const,
+						input: ["text"],
+						output: ["image"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					},
+				],
+				checkedAt: Date.now(),
+			},
+			publish: async () => true,
+			allowNetwork: false,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+		const models = await refreshMetaModels(context, (async () => {
+			throw new Error("network should not be used");
+		}) as unknown as typeof fetch);
+
+		expect(models.map((model) => model.id)).toEqual([fallback.id]);
+	});
+
 	test("does not persist an empty catalog and restores the previous cache", async () => {
 		const fallback = (createMetaProviderConfig().models ?? [])[0];
 		if (!fallback) throw new Error("Meta fallback model is required");

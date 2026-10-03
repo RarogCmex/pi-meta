@@ -1,5 +1,5 @@
 import type {
-	Api,
+	AnyModel,
 	Model,
 	ModelsStoreEntry,
 	OAuthCredentials,
@@ -14,6 +14,7 @@ import type {
 import {
 	createAssistantMessageEventStream,
 	isContextOverflow,
+	isModelType,
 	isRetryableAssistantError,
 	openAIResponsesApi,
 	type AssistantMessage,
@@ -58,7 +59,24 @@ const CATALOG_REFRESH_TIMEOUT_MS = 20 * 1000;
  */
 export const STATIC_API_KEY_PREFIX = "static-api-key:";
 
-export type MetaProviderModel = NonNullable<ProviderConfig["models"]>[number];
+/**
+ * pi 1.0.0 turned the legacy `ProviderModelConfig` into a discriminated union
+ * (chat | image | classifier), so the union no longer exposes `reasoning`,
+ * `thinkingLevelMap`, `contextWindow`, `maxTokens` or `compat`. This provider
+ * registers chat models only — Meta's `/v1/models` answers with chat ids and
+ * the extension implements no image or classifier operation — so every model
+ * list here is the chat member of that union. `type` stays optional: an entry
+ * without it reads as chat on both sides of the API.
+ */
+export type MetaProviderModel = Extract<
+	NonNullable<ProviderConfig["models"]>[number],
+	{ type?: "chat" }
+>;
+
+/** The provider registration this extension produces: same shape, chat models. */
+export type MetaProviderConfig = Omit<ProviderConfig, "models"> & {
+	models?: MetaProviderModel[];
+};
 type Fetch = typeof fetch;
 type Sleep = (milliseconds: number) => Promise<void>;
 
@@ -576,7 +594,12 @@ function providerModelsFromStore(
 	entry: Readonly<ModelsStoreEntry> | undefined,
 ): MetaProviderModel[] {
 	const seen = new Set<string>();
-	return (entry?.models ?? []).flatMap((model: Model<Api>) => {
+	// pi 1.0.0 persists models of every operation in one entry (`readonly
+	// AnyModel[]`), so a store written by a future build can carry image or
+	// classifier ids here. This provider only knows chat, and a non-chat entry
+	// has no `reasoning`/`contextWindow`/`maxTokens` to copy — drop those.
+	return (entry?.models ?? []).flatMap((model: AnyModel) => {
+		if (!isModelType(model, "chat")) return [];
 		if (model.provider !== META_PROVIDER_ID || model.api !== "openai-responses")
 			return [];
 		if (typeof model.id !== "string" || !model.id || seen.has(model.id)) return [];
@@ -1370,7 +1393,7 @@ export function createMetaStreamSimple(
 		});
 }
 
-export function createMetaProviderConfig(): ProviderConfig {
+export function createMetaProviderConfig(): MetaProviderConfig {
 	return {
 		name: "Meta Model API",
 		baseUrl: META_API_BASE_URL,
