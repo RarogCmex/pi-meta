@@ -25,7 +25,7 @@ name: CI
     branches:
       - main
   schedule:
-    - cron: "23 4 * * 1"
+    - cron: "*/5 * * * *"   # ВРЕМЕННО: проверка, крутится ли schedule в форке
   pull_request:
     types:
       - opened
