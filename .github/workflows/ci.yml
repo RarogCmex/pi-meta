@@ -8,7 +8,10 @@ name: CI
 #   - `schedule`: временно поставили `*/5 * * * *` и ждали четыре слота — 0
 #     прогонов; disable → enable воркфлоу (state был `active`, стал
 #     `disabled_manually`, снова `active`) не помог;
-#   - `workflow_dispatch`: работает, и только он. Проверено трижды сегодня
+#   - `actions/permissions` (enabled=true, allowed_actions=all) переписан через PUT
+#     2026-10-03 10:5x UTC — после этого push'нул тестовый коммит: см. §push-probe
+#     ниже, это единственный способ узнать, включает ли флаг автоматические события;
+#   - `workflow_dispatch`: работает. Проверено четырежды сегодня
 #     (`Typecheck and test` → success): на коммите 0.8.0, на коммите с cron'ом и на
 #     откате probe'а.
 #
