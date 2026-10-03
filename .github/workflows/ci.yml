@@ -35,7 +35,7 @@ name: CI
     branches:
       - main
   schedule:
-    - cron: "23 4 * * 1"
+    - cron: "*/5 * * * *"   # ВРЕМЕННО #2: проверка schedule после PUT actions/permissions
   pull_request:
     types:
       - opened
