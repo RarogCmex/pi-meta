@@ -179,6 +179,8 @@ catalog.
 
 ## Verify
 
+Host versions: verified against pi **1.0.0** (2026-10-03) — `bun run typecheck` clean, `bun test` 70 pass / 2 skipped (the live probes) / 0 fail, and `pi -ne -e <repo> --offline --list-models meta` prints the same five fallback ids. pi 1.0.0 made the legacy model-list config a `chat | image | classifier` union and widened its persisted store to every model type; this extension registers chat only (`MetaProviderModel`, `MetaProviderConfig`) and drops non-chat rows when it re-reads pi's store. The same source also typechecks against the 0.86.x line, where those fields were not a union (measured before this change).
+
 ```bash
 pi --list-models meta
 pi -p --provider meta --model muse-spark-1.3 "Reply exactly: META_OK"
