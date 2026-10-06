@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-06
+
+### Changed
+
+- pi 1.0.4 support re-measured, no code changes needed: the extension-API delta from 1.0.0 to 1.0.4 is additive (`registerToolRenderer`/`ToolRendererResolver`, `ToolLoadout.getPromptGuidelines`, optional `samplingParamsByThinkingLevel`; pi-ai added `resolveSamplingParams`, `refreshStoredOAuthCredential`, renamed the built-in `azure-openai-responses` provider id to `azure` and deprecated `hasToolRedefinitions` — none of which this extension touches). `devDependencies` pinned to pi/pi-ai 1.0.4 and `bun.lock` regenerated. Measured 2026-10-06: `bun run typecheck` clean (the repo's pinned TypeScript 5.9.3), `bun test` 70 pass / 2 skip (the live probes) / 0 fail, and `pi -ne -e <repo> --offline --list-models meta` prints the same 5 fallback ids.
+
 ## [0.8.0] - 2026-10-03
 
 ### Changed

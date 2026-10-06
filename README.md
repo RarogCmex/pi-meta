@@ -179,7 +179,7 @@ catalog.
 
 ## Verify
 
-Host versions: verified against pi **1.0.0** (2026-10-03) — `bun run typecheck` clean, `bun test` 70 pass / 2 skipped (the live probes) / 0 fail, and `pi -ne -e <repo> --offline --list-models meta` prints the same five fallback ids. pi 1.0.0 made the legacy model-list config a `chat | image | classifier` union and widened its persisted store to every model type; this extension registers chat only (`MetaProviderModel`, `MetaProviderConfig`) and drops non-chat rows when it re-reads pi's store. The same source also typechecks against the 0.86.x line, where those fields were not a union (measured before this change).
+Host versions: verified against pi **1.0.0** (2026-10-03) and re-verified against pi **1.0.4** / pi-ai **1.0.4** (2026-10-06) — `bun run typecheck` clean (the repo's pinned TypeScript 5.9.3), `bun test` 70 pass / 2 skipped (the live probes) / 0 fail, and `pi -ne -e <repo> --offline --list-models meta` prints the same five fallback ids on both. The 1.0.1–1.0.4 extension-API delta is additive and touches nothing this provider uses. pi 1.0.0 made the legacy model-list config a `chat | image | classifier` union and widened its persisted store to every model type; this extension registers chat only (`MetaProviderModel`, `MetaProviderConfig`) and drops non-chat rows when it re-reads pi's store. The same source also typechecks against the 0.86.x line, where those fields were not a union (measured before this change).
 
 ```bash
 pi --list-models meta
