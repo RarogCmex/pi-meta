@@ -684,19 +684,6 @@ function providerModelsFromStore(
 	});
 }
 
-function modelsForStore(
-	models: MetaProviderModel[],
-): Model<"openai-responses">[] {
-	return models.map((model) => ({
-		...model,
-		api: "openai-responses",
-		provider: META_PROVIDER_ID,
-		baseUrl: model.baseUrl ?? META_API_BASE_URL,
-		input: model.input as Model<"openai-responses">["input"],
-		compat: model.compat as Model<"openai-responses">["compat"],
-	}));
-}
-
 async function cachedMetaModels(
 	context: CompatibleRefreshContext,
 ): Promise<MetaProviderModel[]> {
@@ -704,20 +691,78 @@ async function cachedMetaModels(
 		const stored = context.stored ?? (await context.store?.read());
 		return providerModelsFromStore(stored);
 	} catch {
-		// Catalog persistence is best-effort; bundled fallbacks remain available.
+		// Reading the shared store is best-effort; bundled pins remain available.
 		return [];
 	}
 }
 
-async function persistMetaModels(
-	context: CompatibleRefreshContext,
-	entry: ModelsStoreEntry,
-): Promise<void> {
-	if (context.publish) {
-		await context.publish({ persist: entry });
-		return;
+/**
+ * Apply this extension's measured wire settings to a model row we do not own
+ * (pi's static pin, or a row from pi's `https://pi.dev` remote catalog, which
+ * arrives without a `compat` block). Upstream values win wherever we have
+ * nothing better to say; the two forced fields are measurements, not opinions:
+ * Meta ignores `tool_search_call`/`tool_search_output` (so a tool announced
+ * only through them is never called) and rejects `reasoning.effort: none`.
+ */
+function withMetaWireSettings(model: MetaProviderModel): MetaProviderModel {
+	return {
+		...model,
+		reasoning: model.reasoning ?? true,
+		thinkingLevelMap: {
+			...SPARK_THINKING,
+			...model.thinkingLevelMap,
+			off: null,
+		},
+		input:
+			model.input && model.input.length > 0
+				? model.input
+				: [...DEFAULT_INPUT],
+		inputLimits: model.inputLimits ?? structuredClone(SPARK_INPUT_LIMITS),
+		contextWindow: finitePositive(model.contextWindow, 1_048_576),
+		maxTokens: finitePositive(model.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS),
+		compat: {
+			supportsLongCacheRetention: true,
+			supportsStrictMode: true,
+			...model.compat,
+			supportsToolSearch: false,
+		},
+	};
+}
+
+/**
+ * Build the chat list this extension wants pi to serve for provider `meta`.
+ *
+ * Existence: a catalog fetched from Meta with this key is authoritative — that
+ * is what surfaces account-scoped internal ids and hides public ids the key
+ * cannot reach. Without one, pi's own rows (static pins merged with the
+ * `pi.dev` remote catalog, as persisted in `models-store.json`) win if present,
+ * and the bundled pins are the last resort.
+ *
+ * Metadata: for an id both sides know, pi's row wins over our derived defaults
+ * (upstream re-measures pricing and limits continuously), and
+ * `withMetaWireSettings()` puts our compat/thinking/image limits back on top.
+ *
+ * Nothing here writes `models-store.json`. That entry belongs to pi's
+ * `withRemoteCatalog()`, which persists `{models, checkedAt, lastModified,
+ * etag}` and uses ETag/304 plus a `lastModified` vs bundled-`generatedAt`
+ * freshness rule; our old write carried neither field, so pi ignored the models
+ * we stored and re-downloaded the whole catalog every refresh.
+ */
+export function composeMetaModels(
+	base: readonly MetaProviderModel[],
+): MetaProviderModel[] {
+	const live = liveCatalog.models ?? [];
+	const source =
+		live.length > 0 ? live : base.length > 0 ? base : FALLBACK_MODELS;
+	const upstream = new Map(base.map((model) => [model.id, model]));
+	const seen = new Set<string>();
+	const composed: MetaProviderModel[] = [];
+	for (const model of source) {
+		if (seen.has(model.id)) continue;
+		seen.add(model.id);
+		composed.push(withMetaWireSettings(upstream.get(model.id) ?? model));
 	}
-	await context.store?.write(entry);
+	return composed;
 }
 
 /**
@@ -908,24 +953,17 @@ export async function fetchMetaCatalog(
 	return primary.models;
 }
 
-function sameModelIds(
-	left: readonly MetaProviderModel[],
-	right: readonly MetaProviderModel[],
-): boolean {
-	if (left.length !== right.length) return false;
-	return left.every((model, index) => model.id === right[index]?.id);
-}
-
 /**
  * The catalog this process fetched from Meta itself.
  *
- * Pi 0.86 runs every in-session refresh with `allowNetwork: false`, and
+ * Pi runs every in-session refresh with `allowNetwork: false`, and
  * `composeModelProvider()` then replaces the registered model list with
- * whatever that offline pass returns. Without this state a stale persisted
- * catalog silently wins over the bundled fallbacks: `muse-spark-1.3` disappears
- * from the model list, pi warns "Model not found ... Using custom model id",
- * and Meta answers HTTP 404 `model_not_found` for a model the key really can
- * reach. Keeping the live catalog here lets the offline phase republish it.
+ * whatever that offline pass returns. Without this state the offline phase has
+ * nothing account-specific to offer: `muse-spark-1.3` disappears from the model
+ * list for a key that only exposes internal ids, pi warns "Model not found ...
+ * Using custom model id", and Meta answers HTTP 404 `model_not_found` for a
+ * model the key really can reach. Keeping the live catalog here lets every
+ * later offline phase recompose from it.
  */
 const liveCatalog: {
 	models?: MetaProviderModel[];
@@ -939,27 +977,11 @@ export async function refreshMetaModels(
 	// SAFETY: CompatibleRefreshContext is the union of the Pi 0.83 and 0.84
 	// refresh-context fields that this adapter probes defensively at runtime.
 	const compatibleContext = context as unknown as CompatibleRefreshContext;
+	// Pi's own rows for this provider: its static pins merged with whatever the
+	// `pi.dev` remote catalog persisted. Read-only — see composeMetaModels().
+	const base = await cachedMetaModels(compatibleContext);
 	if (!context.allowNetwork || context.signal?.aborted) {
-		const cached = await cachedMetaModels(compatibleContext);
-		const models =
-			liveCatalog.models && liveCatalog.models.length > 0
-				? [...liveCatalog.models]
-				: cached.length > 0
-					? cached
-					: [...FALLBACK_MODELS];
-		// Repair a persisted catalog that predates this process's own fetch, so
-		// `pi update --models` and the next cold start agree with the live ids.
-		if (liveCatalog.models && !sameModelIds(liveCatalog.models, cached)) {
-			try {
-				await persistMetaModels(compatibleContext, {
-					models: modelsForStore(models),
-					checkedAt: liveCatalog.fetchedAt ?? Date.now(),
-				});
-			} catch {
-				// The in-memory catalog stays usable even if persistence fails.
-			}
-		}
-		return models;
+		return composeMetaModels(base);
 	}
 	const apiKey =
 		context.credential?.type === "oauth"
@@ -967,35 +989,23 @@ export async function refreshMetaModels(
 			: context.credential?.type === "api_key"
 				? context.credential.key
 				: undefined;
-	if (!apiKey) {
-		const cached = await cachedMetaModels(compatibleContext);
-		return cached.length > 0 ? cached : [...FALLBACK_MODELS];
-	}
+	if (!apiKey) return composeMetaModels(base);
 
 	try {
 		const models = await fetchMetaCatalog(apiKey, fetchImpl, context.signal);
-		if (models.length === 0) {
-			const cached = await cachedMetaModels(compatibleContext);
-			return cached.length > 0 ? cached : [...FALLBACK_MODELS];
+		// An empty answer means "no information" (Meta's IPv6 edge answers 200
+		// with an empty list), never "this key has no models": keep whatever the
+		// previous pass knew.
+		if (models.length > 0 && !context.signal?.aborted) {
+			liveCatalog.models = models;
+			liveCatalog.fetchedAt = Date.now();
 		}
-		liveCatalog.models = models;
-		liveCatalog.fetchedAt = Date.now();
-		if (!context.signal?.aborted) {
-			try {
-				await persistMetaModels(compatibleContext, {
-					models: modelsForStore(models),
-					checkedAt: liveCatalog.fetchedAt,
-				});
-			} catch {
-				// Keep the fresh catalog usable even if persistence fails.
-			}
-		}
-		return models;
 	} catch (error) {
 		if (context.signal?.aborted) throw error;
-		const cached = await cachedMetaModels(compatibleContext);
-		return cached.length > 0 ? cached : [...FALLBACK_MODELS];
+		// A failed fetch leaves the previous live catalog, pi's rows and the
+		// bundled pins in place.
 	}
+	return composeMetaModels(base);
 }
 
 export function metaFallbackCost(
@@ -1777,11 +1787,11 @@ export function createMetaProviderConfig(): MetaProviderConfig {
  * network.
  *
  * So the extension fetches the catalog itself with the resolved key, stores it
- * in `liveCatalog` (which `refreshMetaModels` republishes on every offline
- * phase, repairing the persisted store), and re-registers the provider with
- * the fetched models for immediate effect. Fire-and-forget and cooldown-
- * guarded: startup never blocks on Meta, and a failed fetch leaves the
- * restored catalog and bundled fallbacks in place.
+ * in `liveCatalog` (which every later `refreshMetaModels` pass recomposes from,
+ * offline phases included), and re-registers the provider so the picker and the
+ * model snapshot update without waiting for a refresh nobody triggers.
+ * Fire-and-forget and cooldown-guarded: startup never blocks on Meta, and a
+ * failed fetch leaves pi's own rows and the bundled pins in place.
  */
 const catalogRefreshState: {
 	lastAttemptAt?: number;
@@ -1818,14 +1828,16 @@ export function startLiveCatalogRefresh(
 			liveCatalog.models = models;
 			liveCatalog.fetchedAt = Date.now();
 			// Re-registration takes effect immediately after binding, and the
-			// offline refresh it kicks republishes and persists the live catalog.
+			// offline refresh it kicks recomposes from the same live catalog plus
+			// pi's own rows. `registerProvider()` merges by key, so `models` must be
+			// present: an omitted key would keep the previous value.
 			pi.registerProvider(META_PROVIDER_ID, {
 				...createMetaProviderConfig(),
-				models,
+				models: composeMetaModels([]),
 			});
 		} catch {
-			// A failed catalog fetch is not fatal: the restored catalog and the
-			// bundled fallbacks stay registered.
+			// A failed catalog fetch is not fatal: pi's own rows and the bundled
+			// pins stay registered.
 		}
 	})();
 	// Compare against the tracked promise itself: `run.finally(...)` returns a new

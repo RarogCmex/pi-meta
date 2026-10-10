@@ -157,7 +157,7 @@ Disable with `META_TRANSPORT_RETRY=0` (also `false`, `no`, `off`).
 
 Fallback models use a 1,048,576-token context window, up to 131,072 output tokens, text and image input (downscaled to 2000×2000 / 4.5 MB JPEG-80 before upload, matching pi's own pins), and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`. `muse-spark-1.3` also maps thinking `max` → `max`.
 
-The fallback list covers the public Meta Model API ids (not OpenCode Zen `*-contributor-free`). When your key exposes different, account-specific ids, the live catalog discovered on session start replaces this list:
+The fallback list covers the public Meta Model API ids (not OpenCode Zen `*-contributor-free`). When your key exposes different, account-specific ids, the live catalog discovered on session start decides which ids are offered:
 
 > Meta's `/v1/models` is no longer chat-only: a Muse key's catalog (measured
 > 2026-10-11) also lists `sam-3.1`, `muse-image-1.0` and
@@ -185,16 +185,33 @@ To scope Pi's model picker to Meta models:
 
 ### Making context windows visible to external tools
 
-Pi 0.86 runs every in-session model refresh with `allowNetwork: false`, and the
-only networked caller (`pi update --models`) does not load extensions — it
-refreshes pi's built-in static Meta catalog instead. So this extension fetches
-`GET /v1/models` itself on `session_start` (cooldown: 4h per process, skipped
-under `PI_OFFLINE`) and re-registers the provider with the fetched ids. The
-result is persisted to `~/.pi/agent/models-store.json`, repairing a stale store
-left by the built-in provider. External usage tools such as
-[herdr-agent-usage](https://github.com/senna-lang/herdr-agent-usage) can then
-show a percentage (for example, `⛁ 2% (24k)`) instead of only an absolute token
-count. The cached catalog is also used when Pi starts without network access.
+Pi runs every in-session model refresh with `allowNetwork: false`, and the only
+networked caller (`pi update --models`) does not load extensions. So this
+extension fetches `GET /v1/models` itself on `session_start` (cooldown: 4h per
+process, skipped under `PI_OFFLINE`) and re-registers the provider so the picker
+and pi's model snapshot pick the ids up. The fetched catalog is kept in memory
+and recomposed on every later refresh, including offline ones, so it is also
+what Pi uses when it starts without network access.
+
+The composed list is a merge, not a takeover:
+
+- **existence** comes from Meta's catalog when this process fetched one (it is
+  authoritative for what your key can reach, which is what hides public ids
+  that would 404), otherwise from pi's own catalog rows, otherwise from the
+  bundled pins;
+- **metadata** for an id both sides know comes from pi's row — pi 1.1.0 refreshes
+  every builtin provider from `https://pi.dev/api/models/providers/meta` with
+  ETag/304 and a 4h interval, so upstream pricing and limits stay current;
+- **wire settings** (compat flags, `thinkingLevelMap.off: null`, image resize
+  limits) are always ours, including on rows we do not own: pi's catalog entries
+  carry no `compat` block at all.
+
+`~/.pi/agent/models-store.json` is pi's file and this extension no longer writes
+it. It used to persist its own entry there, without the `lastModified`/`etag`
+fields pi's remote catalog uses — pi ignored those models and the write
+clobbered pi's entry, defeating its 304 path. External usage tools such as
+[herdr-agent-usage](https://github.com/senna-lang/herdr-agent-usage) still get
+context windows from pi's own entry.
 
 > **IPv6 note:** measured 2026-10-11 from a dual-stack host, Meta's IPv6 edge
 > answers `GET /v1/models` with HTTP 200 and an empty `data` array (8/8 runs)
@@ -209,12 +226,12 @@ cached Muse Code 0.1.0/R708.1 catalog observed on 2026-08-06 reported a lower
 effective limit of `1,007,997` for `muse-spark-1.2` and
 `muse-spark-1.2-contributor`. If you need percentages to match that specific
 Muse snapshot, you can still set `contextWindow: 1007997` for those models in
-`~/.pi/agent/models.json`; model overrides take precedence over the persisted
+`~/.pi/agent/models.json`; model overrides take precedence over the composed
 catalog.
 
 ## Verify
 
-Host versions: verified against pi **1.0.0** (2026-10-03) and re-verified against pi **1.0.4** / pi-ai **1.0.4** (2026-10-06) — `bun run typecheck` clean (the repo's pinned TypeScript 5.9.3), `bun test` 70 pass / 2 skipped (the live probes) / 0 fail, and `pi -ne -e <repo> --offline --list-models meta` prints the same five fallback ids on both. The 1.0.1–1.0.4 extension-API delta is additive and touches nothing this provider uses. pi 1.0.0 made the legacy model-list config a `chat | image | classifier` union and widened its persisted store to every model type; this extension registers chat only (`MetaProviderModel`, `MetaProviderConfig`) and drops non-chat rows when it re-reads pi's store. The same source also typechecks against the 0.86.x line, where those fields were not a union (measured before this change).
+Host versions: verified against pi **1.0.0** (2026-10-03), pi **1.0.4** / pi-ai **1.0.4** (2026-10-06) and pi **1.1.0** / pi-ai **1.1.0** (2026-10-11, live key) — `bun run typecheck` clean (the repo's pinned TypeScript 5.9.3), `bun test` 90 pass / 1 skip / 0 fail, and `pi -ne -e <repo> --list-models meta` prints the five Spark chat ids at 131.1K max-out. pi 1.1.0 wraps every builtin provider in a remote-catalog fetch from `https://pi.dev/api/models/providers/<id>` (ETag, 4h, persisted with `lastModified`), and its generated meta pins match ours field for field; its `metaProvider()` has no `refreshModels` and no paste-a-key login, so both remain reasons to use this extension. The 1.0.1–1.0.4 extension-API delta is additive and touches nothing this provider uses. pi 1.0.0 made the legacy model-list config a `chat | image | classifier` union and widened its persisted store to every model type; this extension registers chat only (`MetaProviderModel`, `MetaProviderConfig`) and drops non-chat rows when it re-reads pi's store. The same source also typechecks against the 0.86.x line, where those fields were not a union (measured before this change).
 
 ```bash
 pi --list-models meta

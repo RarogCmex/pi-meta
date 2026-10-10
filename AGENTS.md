@@ -26,10 +26,12 @@ startup refresh storm), and `pi update --models` does not load extensions — it
 refreshes pi's built-in static Meta catalog instead. So `session_start` runs
 `startLiveCatalogRefresh()`: fetch `GET /v1/models` with the resolved key,
 store the result in the module-level `liveCatalog`, and re-register the
-provider with the fetched ids. Offline refresh phases republish `liveCatalog`
-and repair the persisted store when it diverges. This is what makes keys whose
-account exposes only internal ids (e.g. `rl-muse-spark-1-3-sglang-playground`)
-work; pi's built-in provider 404s on them.
+provider so the picker and pi's model snapshot update without waiting for a
+refresh nobody triggers. Every later `refreshMetaModels()` pass — offline ones
+included — recomposes from `liveCatalog` plus pi's own rows. This is what makes
+keys whose account exposes only internal ids (e.g.
+`rl-muse-spark-1-3-sglang-playground`) work; pi's built-in provider 404s on
+them.
 
 Two catalog rules measured 2026-10-11 with a live Muse Model API key:
 
@@ -102,27 +104,43 @@ call to Meta's own `/v1/models` anywhere:
   Our `before_provider_request` hook is still the only thing that turns 24h
   retention on, and we still must not advertise `promptCache` lifetimes.
 
-Consequences for this extension:
+Consequences for this extension, and what the merge refactor did about them:
 
 1. Our `models` array replaces pi's pins, so pin drift is a real regression
-   surface (see the parity rule above).
-2. Our `persistMetaModels()` writes the same `models-store.json` entry under
-   provider `meta` **without** `lastModified`/`etag`. Pi's `remoteModels()`
-   ignores such an entry, and our write clobbers pi's — so pi re-downloads the
-   meta catalog in full every networked refresh and its 304 path is dead for
-   this provider. Harmless today (same 5 ids), but it is contention.
+   surface (see the parity rule above). Kept: pins stay registered, because
+   they are the only list that exists for an env-key user on a host that never
+   runs a refresh for this provider.
+2. We used to write the same `models-store.json` entry under provider `meta`
+   **without** `lastModified`/`etag`. Pi's `remoteModels()` ignores such an
+   entry, and our write clobbered pi's — so pi re-downloaded the meta catalog
+   in full on every networked refresh and its ETag/304 path was dead for this
+   provider. **Fixed: the extension never writes that file now.**
+   `persistMetaModels()`/`modelsForStore()` are gone; `refreshMetaModels()`
+   only reads `context.stored`/`context.store.read()` and returns a list, which
+   pi publishes in memory. Verified live 2026-10-11: a seeded pi.dev-shaped
+   entry (`lastModified` + `etag` + a distinctive name/cost on
+   `muse-spark-1.3`) survived a real session byte-for-byte (same md5).
 3. The only thing our live fetch adds over pi's mechanism is account-scoped ids
    pi.dev cannot know (`rl-muse-spark-*`). Everything else — pricing, limits,
-   new public ids — pi's catalog service already delivers, and better.
+   new public ids — pi's catalog service already delivers, and better. So
+   `composeMetaModels(base)` now **merges** instead of choosing one source:
+   existence comes from Meta's catalog when this process fetched one (it is
+   authoritative for what the key can reach, which is what hides public ids
+   that 404), otherwise from pi's rows, otherwise from the pins; metadata for
+   an id both sides know comes from pi's row; and `withMetaWireSettings()` puts
+   our measured wire settings back on rows we do not own — pi's catalog entries
+   carry no `compat` block at all, so without it a republished pi row would
+   lose strict tools, and a future pi default of `supportsToolSearch: true`
+   would silently drop tools (Meta ignores `tool_search_call`).
 
-Direction if this is revisited: keep the pins aligned with pi's, stop
-persisting, and move discovery from `models` + `refreshModels` to the additive
-`oauth.modifyModels(models, credential)` seam (`composeModelProvider` calls it
-with the fully composed base list whenever an OAuth credential is present, and
-our pasted-key login is stored as `type: "oauth"`). That appends discovered
-account-scoped ids without discarding pi's catalog and without touching the
-shared store. Not done yet: it changes registration shape on 0.83–1.0.x hosts
-that the current compatibility shims cover.
+Why not `oauth.modifyModels()`: it is the additive seam (`composeModelProvider`
+calls it with the fully composed base list), but its own docstring in every
+host from 0.83.0 to 1.1.0 labels it "Legacy synchronous credential-dependent
+model projection", and it only runs when `context.credential?.type === "oauth"`
+— so an env-key or `api_key`-credential user would never get the wire settings.
+`refreshModels` is the documented seam, receives pi's rows through
+`context.stored`, and runs for both credential shapes, which is why the merge
+lives there.
 
 ## Verifying with a live key
 
@@ -130,16 +148,23 @@ that the current compatibility shims cover.
 key is also the `meta` entry in `~/.pi/agent/auth.json`, so `bun test` runs the
 live cache probe without any env. Checks that were run on 2026-10-11:
 
-- `bun test` → 87 pass / 1 skip / 0 fail, including the live prompt-cache probe
+- `bun test` → 90 pass / 1 skip / 0 fail, including the live prompt-cache probe
   (3043/3068 tokens cached on the second identical call).
 - `pi -p -ne -e ./extensions/meta.ts --model meta/muse-spark-1.3` → 4/4 `pong`
-  (was 1/3 before the 404 fix).
+  (was 1/3 before the 404 fix), and 6/6 plugin-level turns in a window where
+  3/6 raw requests 404'd.
 - Tool calling through `streamSimple` → a real `toolCall`
   `get_weather({"city":"Tbilisi"})`, `stopReason: "toolUse"`.
 - `pi --list-models meta` → the 5 chat ids at 131.1K max-out, no `sam-3.1`.
-- After a session start, `models-store.json` carries the live catalog order
-  (`muse-spark-1.3-contributor` first) with `maxTokens: 131072` and
-  `inputLimits` — proof that discovery ran under Node via the IPv4 retry.
+- A session start writes `~/.pi/agent/models-store.json` **no more**: a seeded
+  pi.dev-shaped entry survived a real run byte-for-byte. Discovery itself is
+  still provable from that file's history — before the merge refactor our own
+  write left the live catalog order (`muse-spark-1.3-contributor` first) with
+  `maxTokens: 131072` and `inputLimits`, which is what showed the IPv4 retry
+  working under Node.
+- `api.meta.ai` flaps between healthy and hard windows on a minute timescale
+  (raw curl: 12/12 ok, then 16/16 404, then 3/6 404, then 6/6 404). Always
+  re-measure with a raw curl before blaming the extension for a 404.
 
 ## Transparent error handling
 

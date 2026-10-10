@@ -303,37 +303,154 @@ describe("Meta OAuth provider", () => {
 		}
 	});
 
-	test("persists fetched models with complete provider metadata", async () => {
-		let persisted: ModelsStoreEntry | undefined;
+	// `models-store.json` under provider `meta` belongs to pi's
+	// `withRemoteCatalog()`, which persists `{models, checkedAt, lastModified,
+	// etag}` and uses ETag/304 plus a `lastModified` vs bundled-`generatedAt`
+	// freshness rule. Our old write carried neither field: pi ignored the models
+	// we stored (`remoteModels()` returns [] without `lastModified`) and our
+	// entry clobbered pi's, so the meta catalog was re-downloaded in full on
+	// every networked refresh. Mutation control: re-adding a
+	// `persistMetaModels()` call turns both of these red.
+	test("never writes pi's shared models-store entry (Pi 0.83 shape)", async () => {
+		let writes = 0;
 		const context = {
 			credential: { type: "api_key", key: "model-api-key" },
 			store: {
-				read: async () => persisted,
-				write: async (entry: ModelsStoreEntry) => {
-					persisted = entry;
+				read: async () => undefined,
+				write: async () => {
+					writes += 1;
 				},
 				delete: async () => {
-					persisted = undefined;
+					writes += 1;
 				},
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
 		} as unknown as RefreshModelsContext;
-		const before = Date.now();
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({
 				data: [{ id: "muse-spark-1.2" }],
 			})) as unknown as typeof fetch);
 
-		expect(models).toHaveLength(1);
-		expect(persisted?.checkedAt).toBeGreaterThanOrEqual(before);
-		expect(persisted?.models).toHaveLength(1);
-		expect(persisted?.models[0]).toMatchObject({
-			id: "muse-spark-1.2",
-			provider: META_PROVIDER_ID,
-			api: "openai-responses",
-			baseUrl: META_API_BASE_URL,
+		expect(writes).toBe(0);
+		// The fetched catalog is still authoritative for existence, and the row
+		// carries complete provider metadata for the picker.
+		expect(models.map((model) => model.id)).toEqual(["muse-spark-1.2"]);
+		expect(models[0]).toMatchObject({
 			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+		});
+		expect(models[0]?.inputLimits).toBeDefined();
+		expect("provider" in (models[0] as object)).toBe(false);
+	});
+
+	test("merges pi's own catalog metadata into the ids Meta lists", async () => {
+		// pi.dev publishes rows without a compat block; a fetched catalog row is
+		// bare. Existence comes from Meta, metadata from pi, wire settings from us.
+		const upstream = {
+			id: "muse-spark-1.3",
+			name: "Muse Spark 1.3 (upstream)",
+			provider: META_PROVIDER_ID,
+			api: "openai-responses" as const,
+			baseUrl: META_API_BASE_URL,
+			type: "chat" as const,
+			reasoning: true,
+			input: ["text", "image"] as Array<"text" | "image">,
+			cost: { input: 9.99, output: 8.88, cacheRead: 7.77, cacheWrite: 0 },
+			contextWindow: 999_000,
+			maxTokens: 131_072,
+		};
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			stored: { models: [upstream], checkedAt: Date.now() },
+			allowNetwork: true,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+		const models = await refreshMetaModels(context, (async () =>
+			jsonResponse({
+				data: [{ id: "muse-spark-1.3" }, { id: "rl-muse-spark-1-3-sglang-playground" }],
+			})) as unknown as typeof fetch);
+
+		expect(models.map((model) => model.id)).toEqual([
+			"muse-spark-1.3",
+			"rl-muse-spark-1-3-sglang-playground",
+		]);
+		// Upstream measurements win over our derived defaults...
+		expect(models[0]).toMatchObject({
+			name: "Muse Spark 1.3 (upstream)",
+			cost: { input: 9.99, output: 8.88, cacheRead: 7.77 },
+			contextWindow: 999_000,
+		});
+		// ...and our measured wire settings are put back on top.
+		expect(models[0]?.compat).toMatchObject({
+			supportsStrictMode: true,
+			supportsToolSearch: false,
+			supportsLongCacheRetention: true,
+		});
+		expect(models[0]?.thinkingLevelMap?.off).toBeNull();
+		expect(models[0]?.inputLimits).toBeDefined();
+		// An id only Meta knows keeps our derived defaults.
+		expect(models[1]).toMatchObject({ reasoning: true, maxTokens: 131_072 });
+		expect(models[1]?.compat).toMatchObject({ supportsToolSearch: false });
+	});
+
+	test("a fetched catalog hides ids the key cannot reach", async () => {
+		// The internal-id case the extension exists for: pi's rows list the five
+		// public Sparks, Meta lists one account-scoped id. Registering both would
+		// put 404ing ids in pi's picker.
+		const pins = createMetaProviderConfig().models ?? [];
+		const storedRow = (id: string) => ({
+			...pins[0],
+			id,
+			provider: META_PROVIDER_ID,
+			api: "openai-responses" as const,
+			baseUrl: META_API_BASE_URL,
+			type: "chat" as const,
+		});
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			stored: {
+				models: pins.map((model) => storedRow(model.id)),
+				checkedAt: Date.now(),
+			},
+			allowNetwork: true,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+		const models = await refreshMetaModels(context, (async () =>
+			jsonResponse({
+				data: [{ id: "rl-muse-spark-1-3-sglang-playground" }],
+			})) as unknown as typeof fetch);
+
+		expect(models.map((model) => model.id)).toEqual([
+			"rl-muse-spark-1-3-sglang-playground",
+		]);
+	});
+
+	test("keeps pi's rows when no live catalog is available", async () => {
+		const row = {
+			...(createMetaProviderConfig().models ?? [])[0],
+			id: "muse-spark-1.4",
+			provider: META_PROVIDER_ID,
+			api: "openai-responses" as const,
+			baseUrl: META_API_BASE_URL,
+			type: "chat" as const,
+			compat: undefined,
+		};
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			stored: { models: [row], checkedAt: Date.now() },
+			allowNetwork: false,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+		const models = await refreshMetaModels(context, (async () => {
+			throw new Error("network should not be used");
+		}) as unknown as typeof fetch);
+
+		// A future pi.dev-only id survives, and gets a compat block it lacked.
+		expect(models.map((model) => model.id)).toEqual(["muse-spark-1.4"]);
+		expect(models[0]?.compat).toMatchObject({
+			supportsStrictMode: true,
+			supportsToolSearch: false,
 		});
 	});
 
@@ -380,7 +497,7 @@ describe("Meta OAuth provider", () => {
 	// Pi 0.84 replaced the 0.83 `store` read/write pair with an immutable
 	// `stored` snapshot plus generation-checked `publish`. The package supports
 	// both, so both refresh-context shapes need coverage.
-	test("publishes fetched models through the Pi 0.84 refresh context", async () => {
+	test("never publishes a persist through the Pi 0.84 refresh context", async () => {
 		const published: Array<{ persist?: ModelsStoreEntry | null }> = [];
 		const context = {
 			credential: { type: "api_key", key: "model-api-key" },
@@ -391,23 +508,19 @@ describe("Meta OAuth provider", () => {
 			allowNetwork: true,
 			signal: new AbortController().signal,
 		} as unknown as RefreshModelsContext;
-		const before = Date.now();
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({
 				data: [{ id: "muse-spark-1.2" }],
 			})) as unknown as typeof fetch);
 
 		expect("store" in context).toBe(false);
-		expect(models).toHaveLength(1);
-		expect(published).toHaveLength(1);
-		expect(published[0]?.persist?.checkedAt).toBeGreaterThanOrEqual(before);
-		expect(published[0]?.persist?.models).toHaveLength(1);
-		expect(published[0]?.persist?.models[0]).toMatchObject({
-			id: "muse-spark-1.2",
-			provider: META_PROVIDER_ID,
-			api: "openai-responses",
-			baseUrl: META_API_BASE_URL,
+		// Pi publishes the returned list itself; the extension must not push a
+		// `persist` publication into pi's generation-checked store.
+		expect(published).toHaveLength(0);
+		expect(models.map((model) => model.id)).toEqual(["muse-spark-1.2"]);
+		expect(models[0]).toMatchObject({
 			contextWindow: 1_048_576,
+			maxTokens: 131_072,
 		});
 	});
 
