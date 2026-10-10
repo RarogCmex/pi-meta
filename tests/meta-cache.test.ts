@@ -7,8 +7,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	applyMetaResponsesCacheHints,
 	createMetaProviderConfig,
+	fetchMetaCatalog,
 	META_API_BASE_URL,
-	META_MODEL_CATALOG_URL,
 	META_PROMPT_CACHE_RETENTION,
 	META_PROVIDER_ID,
 	probeEncryptedReasoningEntitlement,
@@ -72,27 +72,16 @@ const liveCacheTest = liveApiKey ? test : test.skip;
 /**
  * Keys are scoped to different id sets: a subscription key may expose only
  * internal ids while the public `muse-spark-*` ids answer 404. Resolve the
- * probe model from the live catalog so the cache measurement runs against an
- * id the key can actually reach.
+ * probe model through the extension's own catalog path so the measurement runs
+ * against an id the key can actually reach *and* that is registrable as chat —
+ * the raw catalog's first row is `sam-3.1` (measured 2026-10-11), an image
+ * model that answers HTTP 400 to a text-only probe.
  */
 async function resolveLiveCacheModel(apiKey: string): Promise<string> {
 	try {
-		const response = await fetch(META_MODEL_CATALOG_URL, {
-			headers: {
-				Accept: "application/json",
-				Authorization: `Bearer ${apiKey}`,
-				"x-api-version": "1.0.0",
-			},
-		});
-		if (response.ok) {
-			const body = (await response.json()) as {
-				data?: Array<{ id?: unknown }>;
-			};
-			const first = body.data?.find(
-				(entry) => typeof entry.id === "string" && entry.id,
-			)?.id as string | undefined;
-			if (first) return first;
-		}
+		const models = await fetchMetaCatalog(apiKey);
+		const first = models[0]?.id;
+		if (first) return first;
 	} catch {
 		// Fall through to the bundled probe id.
 	}
@@ -676,22 +665,35 @@ async function callLiveMetaResponses(
 	payload: Record<string, unknown>,
 ): Promise<LiveResponse> {
 	const body = applyMetaResponsesCacheHints({ ...payload, store: false });
-	const response = await fetch(`${META_API_BASE_URL}/responses`, {
-		method: "POST",
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(body),
-	});
-	const raw = (await response.json()) as LiveResponse;
-	if (!response.ok) {
-		throw new Error(
-			`Meta Responses cache probe failed (HTTP ${response.status}): ${JSON.stringify(raw).slice(0, 500)}`,
-		);
+	// Meta's gateway intermittently 404s `model_not_found` for a model the key
+	// can reach (measured 2026-10-11: 5/12 identical raw requests). The probe
+	// measures caching, not that flake, so re-issue a few times before failing.
+	let raw: LiveResponse = {};
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const response = await fetch(`${META_API_BASE_URL}/responses`, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(body),
+		});
+		raw = (await response.json()) as LiveResponse;
+		if (response.ok) return raw;
+		const flaky =
+			response.status === 404 &&
+			JSON.stringify(raw).includes("model_not_found");
+		if (!flaky) {
+			throw new Error(
+				`Meta Responses cache probe failed (HTTP ${response.status}): ${JSON.stringify(raw).slice(0, 500)}`,
+			);
+		}
+		await Bun.sleep(500);
 	}
-	return raw;
+	throw new Error(
+		`Meta Responses cache probe hit 5 consecutive gateway 404s: ${JSON.stringify(raw).slice(0, 300)}`,
+	);
 }
 
 function usageSummary(raw: LiveResponse): string {
@@ -711,7 +713,9 @@ describe("Meta live prompt-cache probe", () => {
 			const first = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let second = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let cacheRead = second.usage?.input_tokens_details?.cached_tokens ?? 0;
-			if (!cacheRead) {
+			// The gateway load-balances across backends, so a hit can need another
+			// attempt or two before the same prefix lands on a warm one.
+			for (let attempt = 0; !cacheRead && attempt < 3; attempt++) {
 				await Bun.sleep(2_000);
 				second = await callLiveMetaResponses(liveApiKey, { ...payload });
 				cacheRead = second.usage?.input_tokens_details?.cached_tokens ?? 0;

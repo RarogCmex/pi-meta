@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tgz
 .env
+secret.env
 .DS_Store
 .pi-subagents/
 .pi-glla/

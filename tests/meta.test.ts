@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import type {
 	ModelsStoreEntry,
@@ -7,17 +7,38 @@ import type {
 import type { MetaProviderModel } from "../extensions/meta.ts";
 import {
 	createMetaProviderConfig,
+	fetchMetaCatalog,
+	isChatCatalogId,
+	isKnownMetaModelId,
 	loginMeta,
 	META_API_BASE_URL,
 	META_MODEL_CATALOG_URL,
 	META_PROVIDER_ID,
+	metaCatalogIPv4Enabled,
 	mintMetaApiKey,
 	refreshMetaModels,
 	refreshMetaToken,
 	resetCatalogRefreshState,
+	setMetaCatalogIPv4Fetcher,
 	STATIC_API_KEY_PREFIX,
 	toProviderModels,
 } from "../extensions/meta.ts";
+
+/**
+ * Live catalog for a Muse Model API key, measured 2026-10-11: bare
+ * OpenAI-style rows, and no longer chat-only — `sam-3.1` (segmentation),
+ * `muse-image-1.0` and `muse-voice-transcribe-1.0` sit next to the Sparks.
+ */
+const LIVE_CATALOG_SNAPSHOT_2026_10_11 = [
+	"sam-3.1",
+	"muse-spark-1.3-contributor",
+	"muse-voice-transcribe-1.0",
+	"muse-spark-1.3",
+	"muse-image-1.0",
+	"muse-spark-1.2-contributor",
+	"muse-spark-1.2",
+	"muse-spark-1.1",
+];
 
 const LIVE_CATALOG_SNAPSHOT_2026_08_10 = [
 	"muse-spark-1.3",
@@ -105,6 +126,80 @@ describe("Meta OAuth provider", () => {
 		expect(models).toEqual(createMetaProviderConfig().models ?? []);
 	});
 
+	// Live-endpoint drift, observed 2026-10-11: the catalog is no longer
+	// chat-only. Registering `sam-3.1` as a chat model puts an id in pi's /model
+	// list that answers HTTP 400 ("SAM 3 requires an input_image or input_video
+	// content part in a user message"). Mutation control: deleting the
+	// `isChatCatalogId` gate in `toProviderModels` turns this test red.
+	test("drops non-chat catalog ids and keeps account-scoped chat ids", () => {
+		const models = toProviderModels({
+			data: LIVE_CATALOG_SNAPSHOT_2026_10_11.map((id) => ({ id })),
+		});
+		expect(models.map((model) => model.id)).toEqual([
+			"muse-spark-1.3-contributor",
+			"muse-spark-1.3",
+			"muse-spark-1.2-contributor",
+			"muse-spark-1.2",
+			"muse-spark-1.1",
+		]);
+
+		for (const id of [
+			"sam-3.1",
+			"muse-image-1.0",
+			"muse-voice-transcribe-1.0",
+		]) {
+			expect(isChatCatalogId(id)).toBe(false);
+		}
+		// Internal ids a subscription key can expose must survive the filter.
+		for (const id of [
+			"rl-muse-spark-1-3-sglang-playground",
+			"goofy_glacier135",
+			"muse-spark-1.3",
+		]) {
+			expect(isChatCatalogId(id)).toBe(true);
+		}
+
+		// Declared input modalities without text are non-chat too.
+		expect(
+			toProviderModels({
+				data: [
+					{
+						id: "muse-spark-voice-only",
+						metadata: { "muse-code": { modalities: { input: ["audio"] } } },
+					},
+				],
+			}),
+		).toHaveLength(0);
+	});
+
+	// This extension's model list replaces pi's pins for provider `meta`
+	// (composeModelProvider -> applyExtension maps the extension's models over
+	// the base list), so anything pi measured and we omit is lost. pi 1.1.0's
+	// generated catalog and https://pi.dev/api/models/providers/meta
+	// (last-modified 2026-10-09) both pin maxTokens 131072 and an image resize
+	// box; without `inputLimits` pi forwards full-size images to Meta.
+	test("pins match pi 1.1.0's generated Meta catalog", () => {
+		const models = createMetaProviderConfig().models ?? [];
+		expect(models).not.toHaveLength(0);
+		for (const model of models) {
+			expect(model.maxTokens).toBe(131_072);
+			expect(model.contextWindow).toBe(1_048_576);
+			expect(model.inputLimits).toEqual({
+				images: {
+					resize: {
+						maxWidth: 2_000,
+						maxHeight: 2_000,
+						maxBytes: 4_718_592,
+						jpegQuality: 80,
+					},
+				},
+			});
+		}
+		// Catalog-discovered ids inherit the same box rather than losing it.
+		const discovered = toProviderModels({ data: [{ id: "muse-spark-9.9" }] });
+		expect(discovered[0]?.inputLimits).toEqual(models[0]?.inputLimits);
+	});
+
 	test("1.3 standard maps thinking max; contributor does not", () => {
 		const byId: Record<string, MetaProviderModel> = Object.fromEntries(
 			(createMetaProviderConfig().models ?? []).map((model: MetaProviderModel) => [
@@ -164,16 +259,16 @@ describe("Meta OAuth provider", () => {
 		const byId = Object.fromEntries(models.map((m) => [m.id, m]));
 		expect(byId["muse-bare-unknown"]).toMatchObject({
 			contextWindow: 1_048_576,
-			maxTokens: 256_000,
+			maxTokens: 131_072,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 		expect(byId["muse-empty-metadata"]).toMatchObject({
 			contextWindow: 1_048_576,
-			maxTokens: 256_000,
+			maxTokens: 131_072,
 		});
 		expect(byId["muse-missing-limits"]).toMatchObject({
 			contextWindow: 1_048_576,
-			maxTokens: 256_000,
+			maxTokens: 131_072,
 			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
 		});
 		expect(byId["muse-missing-output-cost"]).toMatchObject({
@@ -404,6 +499,42 @@ describe("Meta OAuth provider", () => {
 		expect(models.map((model) => model.id)).toEqual([fallback.id]);
 	});
 
+	// A store written before the non-chat filter existed can hold `sam-3.1` as a
+	// fully-formed chat row, and the offline phase republishes whatever it
+	// restores. Filtering on read repairs that without a networked pass.
+	test("drops non-chat ids restored from the persisted store", async () => {
+		const fallback = (createMetaProviderConfig().models ?? [])[0];
+		if (!fallback) throw new Error("Meta fallback model is required");
+		const asChatRow = (id: string) => ({
+			...fallback,
+			id,
+			name: id,
+			provider: META_PROVIDER_ID,
+			api: "openai-responses" as const,
+			baseUrl: META_API_BASE_URL,
+			type: "chat" as const,
+		});
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			stored: {
+				models: [
+					asChatRow("sam-3.1"),
+					asChatRow(fallback.id),
+					asChatRow("muse-voice-transcribe-1.0"),
+				],
+				checkedAt: Date.now(),
+			},
+			publish: async () => true,
+			allowNetwork: false,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+		const restored = await refreshMetaModels(context, (async () => {
+			throw new Error("network should not be used");
+		}) as unknown as typeof fetch);
+
+		expect(restored.map((model) => model.id)).toEqual([fallback.id]);
+	});
+
 	test("does not persist an empty catalog and restores the previous cache", async () => {
 		const fallback = (createMetaProviderConfig().models ?? [])[0];
 		if (!fallback) throw new Error("Meta fallback model is required");
@@ -527,8 +658,13 @@ describe("Meta OAuth provider", () => {
 
 		expect(liveIDs).not.toHaveLength(0);
 		const models = toProviderModels(body);
-		expect(models.map((model) => model.id)).toEqual(liveIDs);
+		// The catalog carries non-chat ids too (sam-*, muse-image-*,
+		// muse-voice-transcribe-*); every mapped model must be one of the live
+		// ids and must be registrable as chat.
+		expect(models.length).toBeGreaterThan(0);
 		for (const model of models) {
+			expect(liveIDs).toContain(model.id);
+			expect(isChatCatalogId(model.id)).toBe(true);
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBeGreaterThan(0);
 			expect(model.maxTokens).toBeGreaterThan(0);
@@ -761,5 +897,119 @@ describe("Meta OAuth provider", () => {
 		await expect(mintMetaApiKey("identity-token", fetchMock)).rejects.toThrow(
 			"Complete setup at https://dev.meta.ai/billing",
 		);
+	});
+});
+
+/**
+ * Measured 2026-10-11 from a dual-stack host: Meta's IPv6 edge answers
+ * `GET /v1/models` with HTTP 200 and an empty `data` array (8/8 runs), while
+ * the IPv4 edge returns the full catalog (8/8). `/v1/chat/completions` splits
+ * the same way. Pi runs on Node, whose `fetch` prefers IPv6, so live discovery
+ * needs an IPv4 retry to see anything at all on such hosts.
+ */
+describe("Meta catalog IPv4 fallback", () => {
+	const originalFetch = globalThis.fetch;
+	const ipv4Catalog: MetaProviderModel[] = toProviderModels({
+		data: [{ id: "rl-muse-spark-1-3-sglang-playground" }, { id: "sam-3.1" }],
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		setMetaCatalogIPv4Fetcher(undefined);
+		delete process.env["META_CATALOG_IPV4"];
+		resetCatalogRefreshState();
+	});
+
+	function stubPrimary(impl: () => Promise<Response>): void {
+		globalThis.fetch = impl as unknown as typeof fetch;
+	}
+
+	test("retries an empty catalog over IPv4", async () => {
+		let ipv4Calls = 0;
+		stubPrimary(async () => jsonResponse({ object: "list", data: [] }));
+		setMetaCatalogIPv4Fetcher(async () => {
+			ipv4Calls += 1;
+			return ipv4Catalog;
+		});
+
+		const models = await fetchMetaCatalog("model-api-key");
+
+		expect(ipv4Calls).toBe(1);
+		// The IPv4 answer goes through the same non-chat filter.
+		expect(models.map((model) => model.id)).toEqual([
+			"rl-muse-spark-1-3-sglang-playground",
+		]);
+	});
+
+	test("retries a failed catalog fetch over IPv4", async () => {
+		stubPrimary(async () => {
+			throw new Error("fetch failed: no IPv6 route");
+		});
+		setMetaCatalogIPv4Fetcher(async () => ipv4Catalog);
+
+		const models = await fetchMetaCatalog("model-api-key");
+
+		expect(models.map((model) => model.id)).toEqual([
+			"rl-muse-spark-1-3-sglang-playground",
+		]);
+	});
+
+	test("keeps the primary answer when it resolves models", async () => {
+		let ipv4Calls = 0;
+		stubPrimary(async () =>
+			jsonResponse({ data: [{ id: "muse-spark-1.3" }] }),
+		);
+		setMetaCatalogIPv4Fetcher(async () => {
+			ipv4Calls += 1;
+			return ipv4Catalog;
+		});
+
+		const models = await fetchMetaCatalog("model-api-key");
+
+		expect(ipv4Calls).toBe(0);
+		expect(models.map((model) => model.id)).toEqual(["muse-spark-1.3"]);
+	});
+
+	test("never retries an auth failure over IPv4", async () => {
+		let ipv4Calls = 0;
+		stubPrimary(async () =>
+			jsonResponse({ error: { message: "invalid key" } }, 401),
+		);
+		setMetaCatalogIPv4Fetcher(async () => {
+			ipv4Calls += 1;
+			return ipv4Catalog;
+		});
+
+		await expect(fetchMetaCatalog("model-api-key")).rejects.toThrow(
+			/Meta model catalog failed \(HTTP 401\)/,
+		);
+		expect(ipv4Calls).toBe(0);
+	});
+
+	test("META_CATALOG_IPV4=0 disables the retry", async () => {
+		let ipv4Calls = 0;
+		process.env["META_CATALOG_IPV4"] = "0";
+		stubPrimary(async () => jsonResponse({ object: "list", data: [] }));
+		setMetaCatalogIPv4Fetcher(async () => {
+			ipv4Calls += 1;
+			return ipv4Catalog;
+		});
+
+		const models = await fetchMetaCatalog("model-api-key");
+
+		expect(ipv4Calls).toBe(0);
+		expect(models).toHaveLength(0);
+		expect(metaCatalogIPv4Enabled({ META_CATALOG_IPV4: "0" })).toBe(false);
+		expect(metaCatalogIPv4Enabled({ META_CATALOG_IPV4: "off" })).toBe(false);
+		expect(metaCatalogIPv4Enabled({})).toBe(true);
+	});
+
+	test("surfaces the original failure when IPv4 has nothing either", async () => {
+		stubPrimary(async () => {
+			throw new Error("fetch failed: boom");
+		});
+		setMetaCatalogIPv4Fetcher(async () => undefined);
+
+		await expect(fetchMetaCatalog("model-api-key")).rejects.toThrow("boom");
 	});
 });

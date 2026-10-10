@@ -119,26 +119,53 @@ What is never retried:
 unchanged, so nothing is duplicated);
 - aborted turns;
 - context overflow (compaction handles it);
-- deterministic failures: `reasoning.encrypted_content` denials,
-`model_not_found`, auth, quota/billing (`insufficient_quota`,
-`GoUsageLimitError`, `out of budget`), content filters, bad requests.
+- deterministic failures: `reasoning.encrypted_content` denials, auth,
+quota/billing (`insufficient_quota`, `GoUsageLimitError`, `out of budget`),
+content filters, bad requests, and `model_not_found` for an id nothing vouches
+for (a typo, or a model Meta retired).
 
-Up to 3 retries with exponential backoff (2s → 4s → 8s, capped at 30s),
-abortable during the wait with `Esc` (reported as an aborted turn). On
-exhaustion pi receives the original error unchanged. Retries and exhaustion are
-surfaced as pi notifications when a UI is present.
+One 404 is the exception. Meta's gateway intermittently answers
+`model_not_found` for a model the key really can reach — measured 2026-10-11
+against `api.meta.ai/v1/responses` with a valid Muse key, which alternated
+between healthy windows (12/12 and 40/40 requests fine) and hard ones (16/16,
+then 10/10, then 9/10 identical requests answering 404 on both IPv4 and IPv6).
+So a 404 for an id the live catalog (or, without one, the bundled pins) vouches
+for *is* retried. If it survives all retries the (key, model) pair is marked
+unreachable and later turns fail fast after a single attempt; the mark is
+cleared by the next turn that delivers content, so recovery is immediate (the
+5-minute expiry is only a safety net).
 
-Two learnings ride along: an `encrypted_content` denial marks the key/model as
-unentitled so later requests strip the include, and a `model_not_found` turn
-kicks a cooldown-guarded live-catalog repair.
+Backoff is exponential and abortable during the wait with `Esc` (reported as an
+aborted turn):
+
+- 5xx/gateway/overload: up to 3 retries, 2s → 4s → 8s, capped at 30s.
+- flaky 404 `model_not_found`: up to 7 retries, 250ms → 1s. Meta answers it in
+  ~150ms without reaching the model, so a degraded window needs depth rather
+  than distance — 8 attempts inside ~6s instead of a 14s hang.
+
+On exhaustion pi receives the original error unchanged. Retries and exhaustion
+are surfaced as pi notifications when a UI is present.
+
+Three learnings ride along: an `encrypted_content` denial marks the key/model as
+unentitled so later requests strip the include, a `model_not_found` turn kicks a
+cooldown-guarded live-catalog repair, and a 404 that burned every retry marks
+the key/model unreachable until a turn succeeds again.
 
 Disable with `META_TRANSPORT_RETRY=0` (also `false`, `no`, `off`).
 
 ## Models
 
-Fallback models use a 1,048,576-token context window, up to 256K output tokens, text and image input, and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`. `muse-spark-1.3` also maps thinking `max` → `max`.
+Fallback models use a 1,048,576-token context window, up to 131,072 output tokens, text and image input (downscaled to 2000×2000 / 4.5 MB JPEG-80 before upload, matching pi's own pins), and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`. `muse-spark-1.3` also maps thinking `max` → `max`.
 
 The fallback list covers the public Meta Model API ids (not OpenCode Zen `*-contributor-free`). When your key exposes different, account-specific ids, the live catalog discovered on session start replaces this list:
+
+> Meta's `/v1/models` is no longer chat-only: a Muse key's catalog (measured
+> 2026-10-11) also lists `sam-3.1`, `muse-image-1.0` and
+> `muse-voice-transcribe-1.0`. This extension registers chat models only, so
+> those families are filtered out — asking one of them for text answers HTTP 400
+> ("SAM 3 requires an input_image or input_video content part"). Unknown bare
+> ids outside those families are kept, which is how account-scoped internal ids
+> keep working.
 
 | id | pricing (input/output/cached) $/M |
 | --- | --- |
@@ -168,6 +195,14 @@ left by the built-in provider. External usage tools such as
 [herdr-agent-usage](https://github.com/senna-lang/herdr-agent-usage) can then
 show a percentage (for example, `⛁ 2% (24k)`) instead of only an absolute token
 count. The cached catalog is also used when Pi starts without network access.
+
+> **IPv6 note:** measured 2026-10-11 from a dual-stack host, Meta's IPv6 edge
+> answers `GET /v1/models` with HTTP 200 and an empty `data` array (8/8 runs)
+> while the IPv4 edge returns the full catalog (8/8); `/v1/chat/completions`
+> splits the same way (404 over IPv6, 200 over IPv4). Pi runs on Node, whose
+> `fetch` prefers IPv6, so an empty (or transport-failed) catalog is retried once
+> over a forced IPv4 `node:https` socket — no dispatcher, no dependency. An HTTP
+> status error such as 401 is never retried. Disable with `META_CATALOG_IPV4=0`.
 
 The bundled fallback uses Meta's nominal `1,048,576`-token context window. A
 cached Muse Code 0.1.0/R708.1 catalog observed on 2026-08-06 reported a lower

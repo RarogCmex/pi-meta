@@ -14,12 +14,18 @@ import {
 	createMetaProviderConfig,
 	createMetaStreamSimple,
 	DEFAULT_META_RETRY,
+	FLAKY_NOT_FOUND_META_RETRY,
+	isKnownMetaModelId,
+	isRetryableMetaError,
 	learnFromMetaError,
 	bindMetaStreamState,
+	markMetaModelNotFound,
 	META_API_BASE_URL,
 	META_PROVIDER_ID,
 	metaRetryDelayMs,
 	metaTransportRetryEnabled,
+	refreshMetaModels,
+	resetCatalogRefreshState,
 	resetMetaStreamState,
 	streamMetaSimple,
 	type MetaInnerApi,
@@ -40,6 +46,22 @@ import {
 const GATEWAY_TIMEOUT =
 	'meta API error (504): {"code":"gateway_timeout","message":"The response stream did not start before the server timeout.","param":null,"type":"server_error"}';
 
+/**
+ * Observed 2026-10-11 on api.meta.ai/v1/responses with a valid Muse key: the
+ * gateway answers HTTP 404 `model_not_found` for a model the key really can
+ * reach — 5 of 12 identical raw requests and 2 of 12 plugin-level turns, on
+ * both IPv4 and IPv6, with the next attempt succeeding.
+ */
+const FLAKY_MODEL_NOT_FOUND =
+	'meta API error (404): {"code":"model_not_found","message":"The requested model was not found.","param":null,"type":"invalid_request_error"}';
+
+function jsonResponse(body: unknown, status = 200): Response {
+	return new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
 function museModel(): Model<"openai-responses"> {
 	const fallback = (createMetaProviderConfig().models ?? [])[0];
 	if (!fallback) throw new Error("Meta fallback model is required");
@@ -51,6 +73,11 @@ function museModel(): Model<"openai-responses"> {
 		input: fallback.input as Model<"openai-responses">["input"],
 		compat: fallback.compat as Model<"openai-responses">["compat"],
 	};
+}
+
+/** An id neither the bundled pins nor a fetched catalog vouch for. */
+function unknownModel(id = "muse-spark-typo"): Model<"openai-responses"> {
+	return { ...museModel(), id };
 }
 
 function context() {
@@ -206,13 +233,75 @@ describe("Meta transient-error classification", () => {
 		const { isRetryableMetaError } = await import("../extensions/meta.ts");
 		for (const text of [
 			"meta API error (400): reasoning `encrypted_content` was not issued to this caller",
-			'meta API error (404): {"code":"model_not_found","message":"The model does not exist"}',
 			"meta API error (401): invalid_api_key",
 			"meta API error (400): content filter triggered",
 			"meta API error (400): unsupported parameter",
 		]) {
 			expect(isRetryableMetaError(message(text))).toBe(false);
 		}
+		// A 404 for an id nothing vouchs for stays a fast, deterministic failure.
+		expect(
+			isRetryableMetaError(
+				errorMessage(
+					unknownModel(),
+					'meta API error (404): {"code":"model_not_found","message":"The model does not exist"}',
+				),
+			),
+		).toBe(false);
+	});
+
+	// Meta's gateway flakes 404 model_not_found for models the key can reach
+	// (measured 2026-10-11), so an id Meta or the bundled pins vouch for is
+	// retried; anything else fails fast.
+	test("retries a flaky 404 model_not_found only for a known model id", async () => {
+		const { isRetryableMetaError } = await import("../extensions/meta.ts");
+		resetCatalogRefreshState();
+		expect(isKnownMetaModelId(museModel().id)).toBe(true);
+		expect(isRetryableMetaError(message(FLAKY_MODEL_NOT_FOUND))).toBe(true);
+		expect(
+			isRetryableMetaError(
+				errorMessage(unknownModel(), FLAKY_MODEL_NOT_FOUND),
+			),
+		).toBe(false);
+		// An explicit verdict overrides the lookup.
+		expect(
+			isRetryableMetaError(message(FLAKY_MODEL_NOT_FOUND), undefined, false),
+		).toBe(false);
+	});
+
+	// Once this process fetched a catalog it is authoritative: a bundled pin the
+	// live catalog no longer lists is retired, not flaky.
+	test("stops retrying model_not_found once the live catalog drops the id", async () => {
+		const { isRetryableMetaError } = await import("../extensions/meta.ts");
+		resetCatalogRefreshState();
+		const context = {
+			credential: { type: "api_key", key: "model-api-key" },
+			allowNetwork: true,
+			signal: new AbortController().signal,
+			publish: async () => true,
+		} as unknown as import("@earendil-works/pi-ai").RefreshModelsContext;
+		await refreshMetaModels(context, (async () =>
+			jsonResponse({
+				data: [{ id: "rl-muse-spark-1-3-sglang-playground" }],
+			})) as unknown as typeof fetch);
+
+		expect(isKnownMetaModelId("rl-muse-spark-1-3-sglang-playground")).toBe(true);
+		expect(isKnownMetaModelId(museModel().id)).toBe(false);
+		expect(isRetryableMetaError(message(FLAKY_MODEL_NOT_FOUND))).toBe(false);
+		resetCatalogRefreshState();
+		expect(isKnownMetaModelId(museModel().id)).toBe(true);
+	});
+
+	test("fails fast on the next turn after a 404 burned every retry", () => {
+		resetCatalogRefreshState();
+		const id = museModel().id;
+		expect(isKnownMetaModelId(id, "key-a")).toBe(true);
+		markMetaModelNotFound("key-a", id);
+		expect(isKnownMetaModelId(id, "key-a")).toBe(false);
+		// Scoped per key: another credential still gets the benefit of the doubt.
+		expect(isKnownMetaModelId(id, "key-b")).toBe(true);
+		resetCatalogRefreshState();
+		expect(isKnownMetaModelId(id, "key-a")).toBe(true);
 	});
 
 	// Overflow is recovered by compaction-and-retry, never by re-sending.
@@ -370,7 +459,7 @@ describe("Meta transparent retry stream", () => {
 	});
 
 	test("does not retry permanent failures", async () => {
-		const model = museModel();
+		const model = unknownModel();
 		const notFound = 'meta API error (404): {"code":"model_not_found","message":"unknown model"}';
 		const { inner, state: callsRef } = scriptedInner(model, [
 			[startEvent(errorMessage(model, notFound)), { type: "error", reason: "error", error: errorMessage(model, notFound) }],
@@ -384,6 +473,113 @@ describe("Meta transparent retry stream", () => {
 		expect(callsRef.calls).toBe(1);
 		expect(delays).toHaveLength(0);
 		expect(events.at(-1)?.type).toBe("error");
+	});
+
+	// The measured gateway flake: a 404 model_not_found for a model the key can
+	// reach. The attempt never committed content, so the retry is safe and pi
+	// only ever sees the recovered turn.
+	test("absorbs a flaky 404 model_not_found for a known model id", async () => {
+		resetCatalogRefreshState();
+		const model = museModel();
+		const notFound = errorMessage(model, FLAKY_MODEL_NOT_FOUND);
+		const { inner, state: callsRef } = scriptedInner(model, [
+			[startEvent(notFound), { type: "error", reason: "error", error: notFound }],
+			[startEvent(errorMessage(model, "")), ...textEvents(errorMessage(model, ""), "Recovered")],
+		]);
+		const { sleep, delays } = sleepRecorder();
+
+		const events = await drain(
+			streamMetaSimple(model, context(), {}, { inner, sleep, enabled: true }),
+		);
+
+		expect(callsRef.calls).toBe(2);
+		expect(delays).toEqual([FLAKY_NOT_FOUND_META_RETRY.minDelayMs]);
+		expect(events.at(-1)?.type).toBe("done");
+		expect(events.some((event) => event.type === "error")).toBe(false);
+	});
+
+	test("gives up on a persistent 404 and forwards the original error", async () => {
+		resetCatalogRefreshState();
+		const model = museModel();
+		const notFound = errorMessage(model, FLAKY_MODEL_NOT_FOUND);
+		const { inner, state: callsRef } = scriptedInner(model, [
+			[startEvent(notFound), { type: "error", reason: "error", error: notFound }],
+		]);
+		const exhausted: Array<{ attempts: number }> = [];
+		const { sleep } = sleepRecorder();
+
+		const events = await drain(
+			streamMetaSimple(model, context(), { apiKey: "exhaust-key" }, {
+				inner,
+				sleep,
+				enabled: true,
+				onRetryExhausted: (info) => exhausted.push(info),
+			}),
+		);
+
+		expect(callsRef.calls).toBe(FLAKY_NOT_FOUND_META_RETRY.maxRetries + 1);
+		expect(exhausted).toHaveLength(1);
+		const last = events.at(-1);
+		expect(last?.type).toBe("error");
+		if (last?.type === "error") {
+			expect(last.error.errorMessage).toBe(FLAKY_MODEL_NOT_FOUND);
+		}
+		// Four consecutive 404s are not a flake: the next turn fails fast instead
+		// of paying the whole backoff again.
+		expect(isKnownMetaModelId(model.id, "exhaust-key")).toBe(false);
+		expect(isRetryableMetaError(notFound, model.contextWindow, isKnownMetaModelId(model.id, "exhaust-key"))).toBe(false);
+		// Another key is not punished for this one.
+		expect(isKnownMetaModelId(model.id, "some-other-key")).toBe(true);
+		resetCatalogRefreshState();
+	});
+
+	// `deps.config` is a test/tuning seam: the flaky-404 budget must not
+	// override an explicit config.
+	test("an injected retry config is honored verbatim for a flaky 404", async () => {
+		resetCatalogRefreshState();
+		const model = museModel();
+		const notFound = errorMessage(model, FLAKY_MODEL_NOT_FOUND);
+		const { inner, state: callsRef } = scriptedInner(model, [
+			[startEvent(notFound), { type: "error", reason: "error", error: notFound }],
+		]);
+		const { sleep, delays } = sleepRecorder();
+
+		await drain(
+			streamMetaSimple(model, context(), { apiKey: "cfg-key" }, {
+				inner,
+				sleep,
+				enabled: true,
+				config: { maxRetries: 2, minDelayMs: 5_000, maxDelayMs: 5_000 },
+			}),
+		);
+
+		expect(callsRef.calls).toBe(3);
+		expect(delays).toEqual([5_000, 5_000]);
+		resetCatalogRefreshState();
+	});
+
+	test("a turn that delivers content clears the fail-fast mark", async () => {
+		resetCatalogRefreshState();
+		const model = museModel();
+		markMetaModelNotFound("clear-key", model.id);
+		expect(isKnownMetaModelId(model.id, "clear-key")).toBe(false);
+
+		const { inner } = scriptedInner(model, [
+			[startEvent(errorMessage(model, "")), ...textEvents(errorMessage(model, ""), "ok")],
+		]);
+		const { sleep } = sleepRecorder();
+		const events = await drain(
+			streamMetaSimple(model, context(), { apiKey: "clear-key" }, {
+				inner,
+				sleep,
+				enabled: true,
+			}),
+		);
+
+		expect(events.at(-1)?.type).toBe("done");
+		// Recovery is immediate: no 5-minute blind window after the gateway heals.
+		expect(isKnownMetaModelId(model.id, "clear-key")).toBe(true);
+		resetCatalogRefreshState();
 	});
 
 	test("learns that a key is not entitled to encrypted reasoning", async () => {

@@ -149,6 +149,46 @@ const SPARK_THINKING: NonNullable<MetaProviderModel["thinkingLevelMap"]> = {
 const DEFAULT_INPUT: MetaProviderModel["input"] = ["text", "image"];
 
 /**
+ * Output-token ceiling and image limits, taken from pi 1.1.0's generated Meta
+ * catalog (static pins, and `https://pi.dev/api/models/providers/meta`,
+ * last-modified 2026-10-09 — both say `maxTokens: 131072` and the same resize
+ * box). This extension's model list *replaces* pi's pins for provider `meta`
+ * (`composeModelProvider()` → `applyExtension()` maps the extension's `models`
+ * over the base list), so anything pi measured and we omit is lost: without
+ * `inputLimits` pi sends full-size images to Meta instead of downscaling.
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 131_072;
+const SPARK_INPUT_LIMITS: NonNullable<MetaProviderModel["inputLimits"]> = {
+	images: {
+		resize: {
+			maxWidth: 2_000,
+			maxHeight: 2_000,
+			maxBytes: 4_718_592,
+			jpegQuality: 80,
+		},
+	},
+};
+
+/**
+ * Meta's `/v1/models` is no longer chat-only. Measured 2026-10-11 with a Muse
+ * Model API key, the live catalog lists `sam-3.1`, `muse-image-1.0` and
+ * `muse-voice-transcribe-1.0` next to the five Spark chat ids — all as bare
+ * entries with no `muse-code` metadata block. This provider registers chat
+ * models only, and a non-chat id answers HTTP 400 ("SAM 3 requires an
+ * input_image or input_video content part in a user message"), so the known
+ * non-chat families are dropped. Unknown bare ids that are *not* in a denied
+ * family stay: that is what keeps account-scoped internal chat ids such as
+ * `rl-muse-spark-1-3-sglang-playground` working.
+ */
+const NON_CHAT_CATALOG_ID_RE =
+	/(^|[-._])(sam|imagen|flux|emulator|whisper|tts|transcribe|transcription|image|images|video|audio|segment|ocr|embed|embedding|embeddings|rerank)([-._]|\d|$)/i;
+
+/** True when a catalog id can be registered as a chat model. */
+export function isChatCatalogId(modelId: string): boolean {
+	return !NON_CHAT_CATALOG_ID_RE.test(modelId);
+}
+
+/**
  * Wire compatibility, measured against `api.meta.ai/v1/responses` on
  * 2026-09-20:
  * - `strict: true` function tools are accepted and constrained as long as the
@@ -189,7 +229,8 @@ function sparkModel(
 		input: [...DEFAULT_INPUT],
 		cost,
 		contextWindow: 1_048_576,
-		maxTokens: 256_000,
+		maxTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+		inputLimits: structuredClone(SPARK_INPUT_LIMITS),
 		compat: { ...SPARK_COMPAT },
 	};
 }
@@ -531,6 +572,15 @@ export function toProviderModels(
 		seen.add(entry.id);
 		const metadata = entry.metadata?.["muse-code"];
 		if (metadata?.is_hidden) return [];
+		// Chat-only provider: drop Meta's image/segmentation/transcription ids.
+		if (!isChatCatalogId(entry.id)) return [];
+		const modalities = metadata?.modalities?.input;
+		if (
+			Array.isArray(modalities) &&
+			modalities.length > 0 &&
+			!modalities.includes("text")
+		)
+			return [];
 		const fallback = FALLBACK_MODELS.find((model) => model.id === entry.id);
 		const catalogName = catalogDisplayName(metadata?.name, entry.id);
 		const variants = metadata?.variants ?? {};
@@ -550,7 +600,7 @@ export function toProviderModels(
 				name: catalogName || fallback?.name || displayName(entry.id),
 				reasoning: metadata?.reasoning ?? fallback?.reasoning ?? true,
 				thinkingLevelMap,
-				input: modalitiesToInput(metadata?.modalities?.input, fallback?.input),
+				input: modalitiesToInput(modalities, fallback?.input),
 				cost: {
 					input: numericCost(metadata?.cost?.input, fallback?.cost.input ?? 0),
 					output: numericCost(metadata?.cost?.output, fallback?.cost.output ?? 0),
@@ -566,7 +616,10 @@ export function toProviderModels(
 				),
 				maxTokens: finitePositive(
 					metadata?.limit?.output,
-					fallback?.maxTokens ?? 256_000,
+					fallback?.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+				),
+				inputLimits: structuredClone(
+					fallback?.inputLimits ?? SPARK_INPUT_LIMITS,
 				),
 				compat: { ...SPARK_COMPAT },
 			} satisfies MetaProviderModel,
@@ -600,6 +653,9 @@ function providerModelsFromStore(
 	// has no `reasoning`/`contextWindow`/`maxTokens` to copy — drop those.
 	return (entry?.models ?? []).flatMap((model: AnyModel) => {
 		if (!isModelType(model, "chat")) return [];
+		// A store written before the non-chat filter can still carry `sam-3.1`
+		// and friends as chat rows; dropping them here repairs it on read.
+		if (!isChatCatalogId(model.id)) return [];
 		if (model.provider !== META_PROVIDER_ID || model.api !== "openai-responses")
 			return [];
 		if (typeof model.id !== "string" || !model.id || seen.has(model.id)) return [];
@@ -620,6 +676,7 @@ function providerModelsFromStore(
 				cost: model.cost,
 				contextWindow: model.contextWindow,
 				maxTokens: model.maxTokens,
+				inputLimits: model.inputLimits ?? structuredClone(SPARK_INPUT_LIMITS),
 				headers: model.headers,
 				compat: model.compat as MetaProviderModel["compat"],
 			},
@@ -667,27 +724,188 @@ async function persistMetaModels(
  * Fetch the Muse catalog with a key. Shared by the pi-driven refresh path and
  * the extension's own live discovery pass.
  */
+function catalogHeaders(apiKey: string): Record<string, string> {
+	return {
+		Accept: "application/json",
+		Authorization: `Bearer ${apiKey}`,
+		"x-api-version": "1.0.0",
+	};
+}
+
+type CatalogAttempt =
+	| { kind: "http"; error: Error }
+	| { kind: "local"; models: MetaProviderModel[]; error?: unknown };
+
+/**
+ * One catalog attempt. An HTTP status error is returned as `http` (auth and
+ * quota do not depend on the address family, so it is never retried); a
+ * transport failure is reported as an empty `local` result carrying the error,
+ * because a missing IPv6 route or a DNS/TLS failure may well succeed over IPv4.
+ */
+async function attemptMetaCatalog(
+	apiKey: string,
+	fetchImpl: Fetch,
+	signal?: AbortSignal,
+): Promise<CatalogAttempt> {
+	try {
+		const response = await fetchImpl(META_MODEL_CATALOG_URL, {
+			headers: catalogHeaders(apiKey),
+			signal,
+		});
+		const body = (await responseBody(response)) as CatalogResponse &
+			Record<string, unknown>;
+		if (!response.ok) {
+			return {
+				kind: "http",
+				error: new Error(
+					`Meta model catalog failed (HTTP ${response.status})${errorDetail(body) ? `: ${errorDetail(body)}` : ""}`,
+				),
+			};
+		}
+		return { kind: "local", models: toProviderModels(body) };
+	} catch (error) {
+		return { kind: "local", models: [], error };
+	}
+}
+
+/**
+ * `META_CATALOG_IPV4=0|false|no|off` disables the IPv4 catalog retry.
+ */
+export function metaCatalogIPv4Enabled(
+	env: Record<string, string | undefined> = process.env,
+): boolean {
+	const raw = env["META_CATALOG_IPV4"]?.trim().toLowerCase();
+	return !(raw === "0" || raw === "false" || raw === "no" || raw === "off");
+}
+
+/**
+ * The fetch this module saw at load time. Production callers reach
+ * `fetchMetaCatalog` with it; every hermetic test either replaces
+ * `globalThis.fetch` afterwards or passes its own stub, so the identity check
+ * keeps the IPv4 retry off the test path (it would otherwise hit the network).
+ */
+const moduleLoadFetch: Fetch = globalThis.fetch;
+
+export type MetaCatalogIPv4Fetcher = (
+	apiKey: string,
+	signal?: AbortSignal,
+) => Promise<MetaProviderModel[] | undefined>;
+
+const catalogIPv4State: { fetcher?: MetaCatalogIPv4Fetcher } = {};
+
+/** Test seam: replace (or clear) the IPv4 catalog transport. */
+export function setMetaCatalogIPv4Fetcher(
+	fetcher?: MetaCatalogIPv4Fetcher,
+): void {
+	catalogIPv4State.fetcher = fetcher;
+}
+
+/**
+ * GET over a forced IPv4 socket. `node:https` is built into Node and Bun, so
+ * this adds no dependency and no global dispatcher: undici's `fetch` cannot be
+ * told which address family to use without one.
+ */
+async function nodeHttpsGetJson(
+	url: string,
+	headers: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<{ status: number; body: unknown } | undefined> {
+	try {
+		const { request } = await import("node:https");
+		const target = new URL(url);
+		return await new Promise((resolve) => {
+			const done = (
+				value: { status: number; body: unknown } | undefined,
+			): void => resolve(value);
+			const req = request(
+				{
+					host: target.hostname,
+					path: `${target.pathname}${target.search}`,
+					method: "GET",
+					family: 4,
+					headers,
+					...(signal ? { signal } : {}),
+				},
+				(res) => {
+					res.setEncoding("utf8");
+					let text = "";
+					res.on("data", (chunk: string) => {
+						text += chunk;
+					});
+					res.on("error", () => done(undefined));
+					res.on("end", () => {
+						try {
+							done({ status: res.statusCode ?? 0, body: JSON.parse(text) });
+						} catch {
+							done(undefined);
+						}
+					});
+				},
+			);
+			req.on("error", () => done(undefined));
+			req.end();
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+async function fetchMetaCatalogIPv4(
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<MetaProviderModel[] | undefined> {
+	const injected = catalogIPv4State.fetcher;
+	if (injected) return injected(apiKey, signal);
+	const result = await nodeHttpsGetJson(
+		META_MODEL_CATALOG_URL,
+		catalogHeaders(apiKey),
+		signal,
+	);
+	if (!result || result.status !== 200) return undefined;
+	const models = toProviderModels(result.body as CatalogResponse);
+	return models.length > 0 ? models : undefined;
+}
+
+function shouldRetryCatalogOverIPv4(
+	fetchImpl: Fetch,
+	signal?: AbortSignal,
+): boolean {
+	if (signal?.aborted === true || !metaCatalogIPv4Enabled()) return false;
+	// An injected transport is a test seam and never touches the network, so it
+	// is always allowed; the real one only runs for the fetch this module saw at
+	// load time, which is what production callers pass.
+	return catalogIPv4State.fetcher !== undefined || fetchImpl === moduleLoadFetch;
+}
+
+/**
+ * Fetch the catalog, retrying once over IPv4 when the first answer carries no
+ * usable models.
+ *
+ * Measured 2026-10-11 against `api.meta.ai` from a dual-stack host: the IPv6
+ * edge (`2a03:2880:f013::face:b00c:0:2`) answers `GET /v1/models` with HTTP
+ * 200 and `{"object":"list","data":[]}` — 8/8 runs — while the IPv4 edge
+ * (`157.240.205.1`) returns the full 8-model catalog, 8/8. `/v1/chat/completions`
+ * splits the same way (404 over IPv6, 200 over IPv4). Pi runs on Node, whose
+ * `fetch` prefers IPv6, so without this retry live discovery silently finds
+ * nothing on such hosts and keys exposing only internal ids stay broken.
+ * A 401/403 is never retried: auth does not depend on the address family.
+ */
 export async function fetchMetaCatalog(
 	apiKey: string,
 	fetchImpl: Fetch = fetch,
 	signal?: AbortSignal,
 ): Promise<MetaProviderModel[]> {
-	const response = await fetchImpl(META_MODEL_CATALOG_URL, {
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${apiKey}`,
-			"x-api-version": "1.0.0",
-		},
-		signal,
-	});
-	const body = (await responseBody(response)) as CatalogResponse &
-		Record<string, unknown>;
-	if (!response.ok) {
-		throw new Error(
-			`Meta model catalog failed (HTTP ${response.status})${errorDetail(body) ? `: ${errorDetail(body)}` : ""}`,
-		);
+	const primary = await attemptMetaCatalog(apiKey, fetchImpl, signal);
+	if (primary.kind === "http") throw primary.error;
+	if (primary.models.length > 0) return primary.models;
+	if (!shouldRetryCatalogOverIPv4(fetchImpl, signal)) {
+		if (primary.error) throw primary.error;
+		return primary.models;
 	}
-	return toProviderModels(body);
+	const ipv4 = await fetchMetaCatalogIPv4(apiKey, signal);
+	if (ipv4 && ipv4.length > 0) return ipv4;
+	if (primary.error) throw primary.error;
+	return primary.models;
 }
 
 function sameModelIds(
@@ -952,9 +1170,11 @@ export function applyMetaResponsesCacheHints(
  *   failure after that point is surfaced verbatim (same bytes as today);
  * - aborted turns are terminal and never retried;
  * - context overflow is recovered by compaction, not by re-sending;
- * - non-transient text (`encrypted_content`, `model_not_found`, auth, quota,
- *   billing, content filters, bad requests) fails fast — checked BEFORE the
- *   retryable catalog so a `429 insufficient_quota` is not re-sent;
+ * - non-transient text (`encrypted_content`, auth, quota, billing, content
+ *   filters, bad requests) fails fast — checked BEFORE the retryable catalog so
+ *   a `429 insufficient_quota` is not re-sent. The one exception is a 404
+ *   `model_not_found` for an id Meta itself lists (see
+ *   `isKnownMetaModelId`): the gateway flakes those, so they are retried;
  * - otherwise pi-ai's own `isRetryableAssistantError` catalog plus Meta/gateway
  *   wordings decides.
  *
@@ -976,6 +1196,37 @@ export const DEFAULT_META_RETRY: MetaRetryConfig = {
 	minDelayMs: 2_000,
 	maxDelayMs: 30_000,
 };
+
+/**
+ * The flaky-404 class gets a deeper, tighter budget than a 504: Meta answers it
+ * in ~150ms without reaching the model, so attempts are nearly free, and a
+ * degraded window needs depth rather than distance. Measured 2026-10-11: the
+ * same key and model alternated between healthy windows (12/12 and 40/40
+ * requests fine) and hard ones (16/16, then 10/10, then 9/10 identical requests
+ * answering 404 `model_not_found`), with roughly 1 request in 6 succeeding
+ * inside a window. Four attempts at 2s→4s→8s turn that into a 14s hang and a
+ * ~50% failure rate; eight attempts inside ~6s reach ~77%.
+ *
+ * Applied only when the caller injected no config, so test seams and
+ * `META_TRANSPORT_RETRY` tuning are honored verbatim.
+ */
+export const FLAKY_NOT_FOUND_META_RETRY: MetaRetryConfig = {
+	maxRetries: 7,
+	minDelayMs: 250,
+	maxDelayMs: 1_000,
+};
+
+function effectiveRetryConfig(
+	errorText: string,
+	knownModel: boolean,
+	config: MetaRetryConfig,
+	injected: boolean,
+): MetaRetryConfig {
+	if (injected || !knownModel) return config;
+	return META_MODEL_NOT_FOUND_RE.test(errorText)
+		? FLAKY_NOT_FOUND_META_RETRY
+		: config;
+}
 
 /** `META_TRANSPORT_RETRY=0|false|no|off` disables the transparent retry layer. */
 export function metaTransportRetryEnabled(
@@ -1006,15 +1257,97 @@ const META_NON_RETRYABLE_RE =
 const META_RETRYABLE_RE =
 	/gateway_?timeout|did not start before the server timeout|response stream did not start|resource_?exhausted|overload|temporaril|too many requests|try again|try your request|service.?unavailable|high demand/i;
 
-/** Classifies a terminal assistant message as a transparently retryable failure. */
+/** Meta's "this model does not exist" 404 body. */
+const META_MODEL_NOT_FOUND_RE = /model_?not_?found|"code"\s*:\s*"model/i;
+
+/**
+ * A 404 that survived every retry is not a gateway flake. Remember it per
+ * (key, model) so later turns fail fast after one attempt instead of paying the
+ * whole backoff again. The mark is cleared by the next turn that delivers
+ * content (`clearMetaModelNotFound`), so recovery is immediate; the TTL is only
+ * a safety net for a session that never asks again.
+ *
+ * Measured 2026-10-11: the flake rate swings from 0/12 to a hard window of
+ * 16/16 identical requests, so both the retry and the fail-fast matter.
+ */
+const NOT_FOUND_BACKOFF_MS = 5 * 60 * 1000;
+const notFoundCache = new Map<string, number>();
+
+function notFoundKey(apiKey: string | undefined, modelId: string): string {
+	return `${apiKey ? apiKeyHash(apiKey) : "nokey"}:${modelId}`;
+}
+
+function notFoundRecently(
+	apiKey: string | undefined,
+	modelId: string,
+	now: number = Date.now(),
+): boolean {
+	const at = notFoundCache.get(notFoundKey(apiKey, modelId));
+	return at !== undefined && now - at < NOT_FOUND_BACKOFF_MS;
+}
+
+export function markMetaModelNotFound(
+	apiKey: string | undefined,
+	modelId: string,
+): void {
+	notFoundCache.set(notFoundKey(apiKey, modelId), Date.now());
+}
+
+/** A turn that delivered content proves the id reachable again. */
+export function clearMetaModelNotFound(
+	apiKey: string | undefined,
+	modelId: string,
+): void {
+	notFoundCache.delete(notFoundKey(apiKey, modelId));
+}
+
+/**
+ * Is this id one Meta (or our own measured pins) says exists?
+ *
+ * The live catalog wins when this process fetched one; otherwise the bundled
+ * pins stand in. Used to tell a gateway flake from a typo'd or retired id. An
+ * id that already burned a full retry cycle on `model_not_found` counts as
+ * unknown for `NOT_FOUND_BACKOFF_MS`, so a key that simply is not entitled to a
+ * pinned id fails fast on the next turn instead of paying the backoff again.
+ */
+export function isKnownMetaModelId(
+	modelId: string | undefined,
+	apiKey?: string,
+): boolean {
+	if (!modelId) return false;
+	if (notFoundRecently(apiKey, modelId)) return false;
+	const live = liveCatalog.models;
+	if (live && live.length > 0) return live.some((model) => model.id === modelId);
+	return FALLBACK_MODELS.some((model) => model.id === modelId);
+}
+
+/**
+ * Classifies a terminal assistant message as a transparently retryable failure.
+ *
+ * `knownModel` says whether the failing id is one Meta lists (defaults to a
+ * lookup of `message.model`). A 404 `model_not_found` on a known-good id is a
+ * gateway flake and is retried; measured 2026-10-11 against
+ * `api.meta.ai/v1/responses` with a valid Muse key and `muse-spark-1.3`: 5 of
+ * 12 identical raw requests and 2 of 12 plugin-level turns answered HTTP 404
+ * `{"code":"model_not_found"}` on both IPv4 and IPv6, and the next attempt
+ * succeeded. Without this exception roughly one turn in six died with a
+ * misleading "model not found". An id Meta does not list stays non-retryable,
+ * so a typo or a retired model still fails fast.
+ */
 export function isRetryableMetaError(
 	message: AssistantMessage,
 	contextWindow?: number,
+	knownModel?: boolean,
 ): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	// Overflow is recovered by compaction, never by re-sending the same context.
 	if (isContextOverflow(message, contextWindow)) return false;
-	if (META_NON_RETRYABLE_RE.test(message.errorMessage)) return false;
+	if (META_NON_RETRYABLE_RE.test(message.errorMessage)) {
+		return (
+			(knownModel ?? isKnownMetaModelId(message.model)) &&
+			META_MODEL_NOT_FOUND_RE.test(message.errorMessage)
+		);
+	}
 	if (isRetryableAssistantError(message)) return true;
 	return META_RETRYABLE_RE.test(message.errorMessage);
 }
@@ -1322,6 +1655,9 @@ export function streamMetaSimple(
 				return;
 			}
 			if (result.kind === "committed") {
+				// Content reached pi: whatever a previous turn concluded about this
+				// id, it is reachable now.
+				clearMetaModelNotFound(options?.apiKey, model.id);
 				outer.end();
 				return;
 			}
@@ -1330,13 +1666,27 @@ export function streamMetaSimple(
 			const errorText = failure.errorMessage ?? "";
 			learnFromMetaError(errorText, model.id, options?.apiKey);
 
+			const knownModel = isKnownMetaModelId(model.id, options?.apiKey);
+			const budget = effectiveRetryConfig(
+				errorText,
+				knownModel,
+				config,
+				deps.config !== undefined,
+			);
 			const retryable =
 				enabled &&
 				!options?.signal?.aborted &&
 				!result.committed &&
-				attempt <= config.maxRetries &&
-				isRetryableMetaError(failure, model.contextWindow);
+				attempt <= budget.maxRetries &&
+				isRetryableMetaError(failure, model.contextWindow, knownModel);
 			if (!retryable) {
+				// Retried and still 404: stop paying the backoff for this id until a
+				// turn succeeds again. `attempt > 1` keeps an id nothing ever vouched
+				// for (a typo) out of the cache — it was never retried in the first
+				// place.
+				if (attempt > 1 && META_MODEL_NOT_FOUND_RE.test(errorText)) {
+					markMetaModelNotFound(options?.apiKey, model.id);
+				}
 				deliverFailure(
 					result,
 					failure.stopReason === "aborted" ? "aborted" : "error",
@@ -1347,10 +1697,10 @@ export function streamMetaSimple(
 				return;
 			}
 
-			const delayMs = metaRetryDelayMs(attempt, config);
+			const delayMs = metaRetryDelayMs(attempt, budget);
 			deps.onRetryScheduled?.({
 				attempt,
-				maxAttempts: config.maxRetries,
+				maxAttempts: budget.maxRetries,
 				delayMs,
 				errorMessage: errorText,
 			});
@@ -1495,6 +1845,8 @@ export function resetCatalogRefreshState(): void {
 	delete catalogRefreshState.inFlight;
 	delete liveCatalog.models;
 	delete liveCatalog.fetchedAt;
+	// The fail-fast marks are process state too; tests must not inherit them.
+	notFoundCache.clear();
 }
 
 export default function metaOAuthProvider(pi: ExtensionAPI): void {
