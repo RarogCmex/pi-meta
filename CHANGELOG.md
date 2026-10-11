@@ -5,11 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-10-11
 
 All of the below was measured on 2026-10-11 with a live Muse Model API key against `api.meta.ai` and a live pi 1.1.0 host.
 
 ### Changed
+
+- `devDependencies` re-pinned to pi/pi-ai **1.1.0** (from 1.0.4) and `bun.lock` regenerated, so CI typechecks against the host everyone now runs. No code changes were needed: the 1.0.4 → 1.1.0 extension-API delta is additive (`durationMs`/`outputPad` on tool result renderers, `aborted` on the `agent_settled` event) and the pi-ai delta is additive too (`openai-decisions` classifier api, `durationMs`, `images` on a content type) — none of which this provider touches. Measured: `bun run typecheck` clean against 1.1.0, `bun test` 90 pass / 1 skip / 0 fail, and `pi -ne -e <repo> --list-models meta` on a pi 1.1.0 host prints the five Spark chat ids at 131.1K. What *did* change behaviourally in 1.1.0 is the model layer: every builtin provider is now wrapped in `withRemoteCatalog()` (pi.dev catalog, ETag/304, 4h), which is what the merge refactor below responds to.
 
 - The extension no longer writes `~/.pi/agent/models-store.json`. That entry belongs to pi's `withRemoteCatalog()`, which persists `{models, checkedAt, lastModified, etag}`, validates with `if-none-match`/304 and discards a stored entry older than its bundled catalog. Our write carried neither `lastModified` nor `etag`: pi's `remoteModels()` ignored the models we stored, and we clobbered pi's entry, so the meta catalog was re-downloaded in full on every networked refresh. `persistMetaModels()` and `modelsForStore()` are gone; `refreshMetaModels()` only reads `context.stored` / `context.store.read()` and returns a list for pi to publish in memory. Verified live: a seeded pi.dev-shaped entry (`lastModified` + `etag` + a distinctive name and cost on `muse-spark-1.3`) survived a real session byte-for-byte, same md5.
 - `composeMetaModels(base)` merges instead of choosing one source. Existence: the catalog fetched from Meta with this key when this process has one (authoritative for what the key can reach, which is what hides public ids that would 404), otherwise pi's own rows, otherwise the bundled pins. Metadata: for an id both sides know, pi's row wins over our derived defaults, so upstream price and limit updates reach us. Wire settings: `withMetaWireSettings()` re-applies our measurements to rows we do not own — pi's catalog entries carry no `compat` block at all, so without this a republished pi row would lose `supportsStrictMode`, and it forces the two measured absolutes (`supportsToolSearch: false`, because Meta accepts and ignores `tool_search_call`/`tool_search_output`; `thinkingLevelMap.off: null`, because Meta rejects `reasoning.effort: none`).
