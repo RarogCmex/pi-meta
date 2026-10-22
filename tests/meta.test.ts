@@ -53,6 +53,7 @@ const FALLBACK_CATALOG_IDS = [
 	"muse-spark-1.2",
 	"muse-spark-1.2-contributor",
 	"muse-spark-1.1",
+	"muse-wonder-1.0",
 ];
 const liveApiKey = (
 	globalThis as { process?: { env?: Record<string, string> } }
@@ -174,13 +175,22 @@ describe("Meta OAuth provider", () => {
 
 	// This extension's model list replaces pi's pins for provider `meta`
 	// (composeModelProvider -> applyExtension maps the extension's models over
-	// the base list), so anything pi measured and we omit is lost. pi 1.1.0's
+	// the base list), so anything pi measured and we omit is lost. pi 1.4.0's
 	// generated catalog and https://pi.dev/api/models/providers/meta
-	// (last-modified 2026-10-09) both pin maxTokens 131072 and an image resize
-	// box; without `inputLimits` pi forwards full-size images to Meta.
-	test("pins match pi 1.1.0's generated Meta catalog", () => {
+	// (last-modified 2026-10-22) both pin maxTokens 131072 and an image resize
+	// box; without `inputLimits` pi forwards full-size images to Meta. The id
+	// list is asserted too: pi 1.4.0 added `muse-wonder-1.0`, and a pin pi
+	// measures but we omit disappears for env-key users with an empty store.
+	test("pins match pi 1.4.0's generated Meta catalog", () => {
 		const models = createMetaProviderConfig().models ?? [];
-		expect(models).not.toHaveLength(0);
+		expect(models.map((model) => model.id)).toEqual([
+			"muse-spark-1.3",
+			"muse-spark-1.3-contributor",
+			"muse-spark-1.2",
+			"muse-spark-1.2-contributor",
+			"muse-spark-1.1",
+			"muse-wonder-1.0",
+		]);
 		for (const model of models) {
 			expect(model.maxTokens).toBe(131_072);
 			expect(model.contextWindow).toBe(1_048_576);
@@ -200,7 +210,7 @@ describe("Meta OAuth provider", () => {
 		expect(discovered[0]?.inputLimits).toEqual(models[0]?.inputLimits);
 	});
 
-	test("1.3 standard maps thinking max; contributor does not", () => {
+	test("1.3 standard and wonder map thinking max; contributor does not", () => {
 		const byId: Record<string, MetaProviderModel> = Object.fromEntries(
 			(createMetaProviderConfig().models ?? []).map((model: MetaProviderModel) => [
 				model.id,
@@ -208,6 +218,7 @@ describe("Meta OAuth provider", () => {
 			]),
 		);
 		expect(byId["muse-spark-1.3"]?.thinkingLevelMap?.max).toBe("max");
+		expect(byId["muse-wonder-1.0"]?.thinkingLevelMap?.max).toBe("max");
 		expect(byId["muse-spark-1.3-contributor"]?.thinkingLevelMap?.max).toBe(null);
 	});
 
@@ -395,9 +406,9 @@ describe("Meta OAuth provider", () => {
 	});
 
 	test("a fetched catalog hides ids the key cannot reach", async () => {
-		// The internal-id case the extension exists for: pi's rows list the five
-		// public Sparks, Meta lists one account-scoped id. Registering both would
-		// put 404ing ids in pi's picker.
+		// The internal-id case the extension exists for: pi's rows list the
+		// public catalog ids, Meta lists one account-scoped id. Registering both
+		// would put 404ing ids in pi's picker.
 		const pins = createMetaProviderConfig().models ?? [];
 		const storedRow = (id: string) => ({
 			...pins[0],

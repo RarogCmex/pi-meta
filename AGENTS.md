@@ -65,7 +65,11 @@ the base list): anything pi measured and we omit is lost. pi 1.1.0's bundle and
 `maxTokens: 131072` (we said 256000) and an `inputLimits.images.resize` box of
 2000×2000 / 4718592 bytes / JPEG 80 (we had none, so pi forwarded full-size
 images). Both now come from `DEFAULT_MAX_OUTPUT_TOKENS` / `SPARK_INPUT_LIMITS`,
-and `tests/meta.test.ts` asserts the parity.
+and `tests/meta.test.ts` asserts the parity. As of pi 1.4.0 (bundle
+`providers/data/meta.json` and pi.dev, last-modified 2026-10-22) those numbers
+are unchanged, but the catalog grew a sixth chat id, `muse-wonder-1.0` ("Muse
+Wonder", cost 4/20/0.2/0, thinking `max` → `max` like `muse-spark-1.3`): it is
+pinned in `FALLBACK_MODELS`, and the parity test asserts the full id list.
 
 Wire compatibility (measured 2026-09-20 against `api.meta.ai/v1/responses`):
 
@@ -78,6 +82,10 @@ Wire compatibility (measured 2026-09-20 against `api.meta.ai/v1/responses`):
 Hermetic OAuth and catalog tests live in `tests/meta.test.ts`.
 
 ## pi 1.1.0's built-in Meta provider (measured 2026-10-11)
+
+Re-checked against the pi 1.4.0 bundle on 2026-10-22: unchanged — still no
+`refreshModels` on `metaProvider()`, still the same device-flow `metaOAuth`
+with no paste-a-key path, still `withRemoteCatalog()` over every builtin.
 
 Upstream ships Meta as **static pins plus a pi-hosted remote catalog**, with no
 call to Meta's own `/v1/models` anywhere:

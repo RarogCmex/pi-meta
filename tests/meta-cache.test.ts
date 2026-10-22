@@ -189,9 +189,12 @@ describe("Meta Responses cache and reasoning contracts", () => {
 	test("keeps off unmapped so Meta never receives reasoning.effort none by default", () => {
 		for (const model of fallbackModels()) {
 			expect(model.thinkingLevelMap?.off).toBeNull();
-			// 1.3 standard is the only Spark that maps thinking `max` → `max`.
+			// 1.3 standard is the only Spark that maps thinking `max` → `max`;
+			// Muse Wonder (pi 1.4.0's generated catalog) maps it too.
 			expect(model.thinkingLevelMap?.max).toBe(
-				model.id === "muse-spark-1.3" ? "max" : null,
+				model.id === "muse-spark-1.3" || model.id === "muse-wonder-1.0"
+					? "max"
+					: null,
 			);
 		}
 		const catalogued = toProviderModels({

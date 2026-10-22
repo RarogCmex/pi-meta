@@ -135,6 +135,8 @@ const CONTRIBUTOR_COST = {
 	cacheRead: 0.002,
 	cacheWrite: 0,
 };
+/** pi 1.4.0's generated catalog prices Muse Wonder above every Spark. */
+const WONDER_COST = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 };
 const SPARK_THINKING: NonNullable<MetaProviderModel["thinkingLevelMap"]> = {
 	off: null,
 	minimal: "minimal",
@@ -149,9 +151,9 @@ const SPARK_THINKING: NonNullable<MetaProviderModel["thinkingLevelMap"]> = {
 const DEFAULT_INPUT: MetaProviderModel["input"] = ["text", "image"];
 
 /**
- * Output-token ceiling and image limits, taken from pi 1.1.0's generated Meta
+ * Output-token ceiling and image limits, taken from pi 1.4.0's generated Meta
  * catalog (static pins, and `https://pi.dev/api/models/providers/meta`,
- * last-modified 2026-10-09 — both say `maxTokens: 131072` and the same resize
+ * last-modified 2026-10-22 — both say `maxTokens: 131072` and the same resize
  * box). This extension's model list *replaces* pi's pins for provider `meta`
  * (`composeModelProvider()` → `applyExtension()` maps the extension's `models`
  * over the base list), so anything pi measured and we omit is lost: without
@@ -254,6 +256,12 @@ const FALLBACK_MODELS: MetaProviderModel[] = [
 		CONTRIBUTOR_COST,
 	),
 	sparkModel("muse-spark-1.1", "Muse Spark 1.1", PAID_COST),
+	// Entered pi's generated catalog between 1.1.0 and 1.4.0; like the 1.3
+	// standard Spark it maps thinking `max` → `max`.
+	sparkModel("muse-wonder-1.0", "Muse Wonder", WONDER_COST, {
+		...SPARK_THINKING,
+		max: "max",
+	}),
 ];
 
 export const DEFAULT_MUSE_MODEL = FALLBACK_MODELS[0].id;

@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-22
+
+Re-verified against pi / pi-ai **1.4.0** offline; the billable live probes were deliberately not run (no `meta` credential is present in this environment's `~/.pi/agent/auth.json` anymore, so `bun test` skips them on its own).
+
+### Changed
+
+- `devDependencies` re-pinned to pi/pi-ai **1.4.0** (from 1.1.0) and `bun.lock` regenerated; the lock no longer carries `@earendil-works/chord` — pi 1.2.0 dropped that dependency together with the experimental `./client` / `./experimental/plugin` stack, none of which this extension ever imported. The 1.2.0–1.4.0 breaking changes otherwise do not touch this provider: it uses only `registerProvider`, `session_start` and `before_provider_request` — not the unioned `before_agent_start` (1.2.0), not `before_provider_headers` (whose new 1.4.0 attribution ordering only affects that hook), not `generateSummary`'s ignored `reserveTokens` (1.4.0), and the 1.3.0 `kimi-coding` base-URL rule and the 1.4.0 default-model swaps (Copilot/NVIDIA/Xiaomi) belong to other providers. Measured 2026-10-22: `bun run typecheck` clean against 1.4.0 (the repo's pinned TypeScript 5.9.3), `bun test` 89 pass / 2 skip (both live probes) / 0 fail, and `pi -ne -e <repo> --list-models meta` on a pi 1.4.0 host prints all six pinned ids at 131.1K max-out.
+
+### Added
+
+- A `muse-wonder-1.0` pin: pi's generated Meta catalog grew from five chat ids to six between 1.1.0 and 1.4.0 — both the bundled `providers/data/meta.json` and `https://pi.dev/api/models/providers/meta` (last-modified 2026-10-22) list "Muse Wonder" with cost 4/20/0.2/0, the same `contextWindow` 1048576, `maxTokens` 131072 and image-resize box (2000×2000 / 4718592 / JPEG 80), and thinking `max` → `max` like `muse-spark-1.3`. Because the extension's `models` array *replaces* pi's list for provider `meta`, a pin pi measured and we omit would be lost for an env-key user whose store has no meta rows, and the id would also stop being "known" to the flaky-404 retry layer (`isKnownMetaModelId()` falls back to the pins when this process fetched no live catalog). The parity test now asserts the full pin id list against pi 1.4.0's catalog, and the thinking-`max` test covers Wonder.
+
 ## [0.9.0] - 2026-10-11
 
 All of the below was measured on 2026-10-11 with a live Muse Model API key against `api.meta.ai` and a live pi 1.1.0 host.
