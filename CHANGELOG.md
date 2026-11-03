@@ -9,16 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`META_PROXY_URL`** — a provider-scoped HTTP `CONNECT` tunnel. Meta gates the
-  Model API by exit geography and the gate is silent: measured 2026-11-03 with a
-  key that works, `/v1/responses` answered **8/8 `404 model_not_found` direct**
-  and **8/8 `200` through a US residential exit**, while `GET /v1/models`
-  answered `200 {"data":[]}` on the gated exit. `createMetaProxyFetch()` opens
-  the tunnel, speaks HTTP/1.1 over it, streams responses unbuffered, and is
-  applied to both `streamSimple` and the catalog fetch. No dependency, no global
-  dispatcher: `HTTPS_PROXY`/`httpProxy` stay untouched because pi's proxy is
-  process-wide and reroutes every provider (measured: NVIDIA answers `403`
-  through the same exit).
+- **`META_PROXY` / `META_PROXIES`** — provider-scoped HTTP `CONNECT` tunnels,
+  shaped like `pi-nvidia-plus`'s `NVIDIA_NIM_PROXY` / `NVIDIA_NIM_PROXIES`
+  (comma-separated list wins over the single value; no file source). Meta gates
+  the Model API by exit geography and the gate is silent: measured 2026-11-03
+  with a key that works, `/v1/responses` answered **8/8 `404 model_not_found`
+  direct** and **8/8 `200` through a US residential exit**, while `GET /v1/models`
+  answered `200 {"data":[]}` on the gated exit.
+  `parseMetaProxy()` accepts `http://host:port`, `host:port` and the
+  `host:port:user:pass` line a proxy seller prints; `https://` (TLS to the proxy)
+  and SOCKS are refused by name with credentials redacted. `createMetaProxyFetch()`
+  opens the tunnel, speaks HTTP/1.1 over it, streams responses unbuffered, and is
+  applied to both `streamSimple` and the catalog fetch.
+  With several endpoints each request walks them in order, and an endpoint that
+  fails before the first response byte is quarantined for
+  `META_PROXY_QUARANTINE_MS` (60 s, no lasting denylist) so a flaky exit costs one
+  attempt instead of the turn — measured live: a dead first exit plus a working
+  second gave `pong` in 3.6 s. A proxy that answers anything, even `404`, is
+  healthy; when every endpoint is cooling they are all retried.
+  No dependency, no global dispatcher: `HTTPS_PROXY`/`httpProxy` stay untouched
+  because pi's proxy is process-wide and reroutes every provider (measured:
+  NVIDIA answers `403` through the same exit).
 
 ### Fixed
 
@@ -40,13 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still means "no information".
 - `session_start` warns once (`pi-meta: Meta returned an empty model catalog for
   this key — the account has no model access`) instead of leaving the failure to
-  surface as a bare 404 mid-turn.
-- The live cache probe uses `META_PROXY_URL` when it is set and treats a gated
+  surface as a bare 404 mid-turn, and warns immediately when `META_PROXY` cannot
+  be parsed (a malformed proxy used to be swallowed by the startup pass).
+- The live cache probe uses `META_PROXY`/`META_PROXIES` when set and treats a gated
   exit (catalog listed, calls 404) as "nothing to measure" instead of a failure;
-  the hermetic suites clear `META_PROXY_URL` in `beforeEach` so a proxy in the
+  the hermetic suites clear them in `beforeEach` so a proxy in the
   developer shell can never reroute a stubbed test.
-- `bun run typecheck` clean, `bun test` **97 pass / 1 skip / 0 fail** with and
-  without `META_PROXY_URL`.
+- `bun run typecheck` clean, `bun test` **106 pass / 1 skip / 0 fail** with and
+  without a proxy configured (`tests/meta-proxy.test.ts` covers parsing, the
+  `host:port:user:pass` form, CONNECT credentials, fall-through and quarantine).
 
 ## [0.10.2] - 2026-11-03
 

@@ -345,7 +345,7 @@ describe("Meta transient-error classification", () => {
 
 describe("Meta transparent retry stream", () => {
 	beforeEach(() => {
-		delete process.env["META_PROXY_URL"];
+		delete process.env["META_PROXY"];
 		resetMetaProxyFetch();
 		resetMetaStreamState();
 	});

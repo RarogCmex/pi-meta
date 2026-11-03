@@ -856,7 +856,7 @@ export function setMetaCatalogIPv4Fetcher(
 /**
  * Optional provider-scoped proxy for Meta's API.
  *
- * Measured 2026-11-03 from a Georgian residential line with two working keys:
+ * Measured 2026-11-03 from a Georgian residential line with a working key:
  * `GET /v1/models` answers `200 {"data":[]}` and every chat id answers `404
  * model_not_found`, while the same key behind a US residential exit lists nine
  * ids and completes turns. Meta gates the Model API by exit geography, so the
@@ -864,56 +864,198 @@ export function setMetaCatalogIPv4Fetcher(
  *
  * Pi's own proxy support is a single process-wide `EnvHttpProxyAgent` (settings
  * `httpProxy`, or `HTTP(S)_PROXY`), which routes *every* provider through it —
- * measured: NVIDIA answers `403` through the same exit. `META_PROXY_URL` keeps
- * the detour local to this provider: a fetch that opens an HTTP `CONNECT`
- * tunnel to the proxy and speaks HTTP/1.1 to `api.meta.ai` over it.
+ * measured: NVIDIA answers `403` through the same exit. These variables keep the
+ * detour local to this provider: a fetch that opens an HTTP `CONNECT` tunnel and
+ * speaks HTTP/1.1 to `api.meta.ai` over it.
+ *
+ * Sources mirror `pi-nvidia-plus` (`NVIDIA_NIM_PROXY` / `NVIDIA_NIM_PROXIES`),
+ * minus the file: `META_PROXIES` (comma-separated, one-shot runs) wins, then
+ * `META_PROXY` (one endpoint). A scheme may be omitted (`host:port` means
+ * `http://`), credentials ride in the userinfo, and parse failures name the
+ * variable and redact the secret.
  */
-export function metaProxyUrl(
-	env: Record<string, string | undefined> = process.env,
-): string | undefined {
-	const raw = env["META_PROXY_URL"]?.trim();
-	return raw ? raw : undefined;
+export interface ParsedMetaProxy {
+	/** Normalized URL with credentials — identity of the endpoint. */
+	href?: string;
+	/** `host:port` with userinfo stripped — safe for notices and logs. */
+	display?: string;
+	error?: string;
 }
 
-let cachedProxyFetch: { url: string; fetch: Fetch } | undefined;
+/** CONNECT/TLS failures quarantine an endpoint for this long, then retry it. */
+export const META_PROXY_QUARANTINE_MS = 60_000;
 
-/** The fetch for `META_PROXY_URL`, cached per URL; `undefined` when unset. */
+function redactProxyValue(value: string): string {
+	return value.replace(/\/\/[^/@]*@/, "//***@");
+}
+
+/**
+ * Accepts the three shapes people paste: `http://host:port`, `host:port`, and
+ * the `host:port:user:pass` line a proxy seller hands out. The last one is
+ * rewritten to the URL form so nothing downstream has to know about it.
+ */
+function withProxyScheme(value: string): string {
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+	if (value.includes("@")) return `http://${value}`;
+	const parts = value.split(":");
+	if (parts.length < 4) return `http://${value}`;
+	const [host, port, user, ...rest] = parts as [string, string, string, ...string[]];
+	if (!host || !/^\d+$/.test(port) || !user || rest.length === 0)
+		return `http://${value}`;
+	return `http://${encodeURIComponent(user)}:${encodeURIComponent(rest.join(":"))}@${host}:${port}`;
+}
+
+/**
+ * Parses one endpoint. Only HTTP `CONNECT` proxies are supported: `https://`
+ * would need a TLS handshake to the proxy itself and SOCKS needs a client
+ * implementation, so both are refused by name instead of half-working.
+ */
+export function parseMetaProxy(raw: string | undefined): ParsedMetaProxy {
+	const value = raw?.trim();
+	if (!value) return { error: "pi-meta: META_PROXY is empty" };
+	const candidate = withProxyScheme(value);
+	// Redact against the normalized form: `user:pass@host` has no `//` yet.
+	const shown = redactProxyValue(candidate);
+	let url: URL;
+	try {
+		url = new URL(candidate);
+	} catch {
+		return {
+			error: `pi-meta: META_PROXY is not a proxy URL: ${shown}`,
+		};
+	}
+	if (!url.hostname) {
+		return { error: `pi-meta: META_PROXY has no host: ${shown}` };
+	}
+	if (
+		url.protocol === "https:" ||
+		url.protocol === "socks:" ||
+		url.protocol === "socks5:" ||
+		url.protocol === "socks5h:"
+	) {
+		const family =
+			url.protocol === "https:" ? "an https:// proxy (TLS to the proxy)" : "SOCKS";
+		return {
+			error: `pi-meta: META_PROXY must be an http:// CONNECT proxy; ${family} is not supported: ${shown}`,
+		};
+	}
+	if (url.protocol !== "http:") {
+		return {
+			error: `pi-meta: META_PROXY must be an http:// CONNECT proxy, got ${url.protocol}: ${shown}`,
+		};
+	}
+	const port = url.port || "80";
+	return {
+		href: url.toString(),
+		display: `${url.hostname}:${port}`,
+	};
+}
+
+/** Raw endpoint strings, in priority order; empty when no proxy is configured. */
+export function metaProxySources(
+	env: Record<string, string | undefined> = process.env,
+): string[] {
+	const list = (env["META_PROXIES"] ?? "")
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+	if (list.length > 0) return list;
+	const single = env["META_PROXY"]?.trim() ?? "";
+	return single ? [single] : [];
+}
+
+/** Parses every configured endpoint, keeping the failures next to the good ones. */
+export function metaProxyEndpoints(
+	env: Record<string, string | undefined> = process.env,
+): Array<Required<Pick<ParsedMetaProxy, "href" | "display">>> {
+	const parsed = metaProxySources(env).map(parseMetaProxy);
+	const failure = parsed.find((entry) => entry.error);
+	if (failure) throw new Error(failure.error);
+	return parsed as Array<Required<Pick<ParsedMetaProxy, "href" | "display">>>;
+}
+
+let cachedProxyFetch: { key: string; fetch: Fetch } | undefined;
+
+/** The fetch for the configured proxies, cached per endpoint set. */
 export function metaProxyFetch(
 	env: Record<string, string | undefined> = process.env,
 ): Fetch | undefined {
-	const url = metaProxyUrl(env);
-	if (!url) return undefined;
-	if (cachedProxyFetch?.url === url) return cachedProxyFetch.fetch;
-	const created = createMetaProxyFetch(url);
-	cachedProxyFetch = { url, fetch: created };
+	const endpoints = metaProxyEndpoints(env);
+	if (endpoints.length === 0) return undefined;
+	const key = endpoints.map((endpoint) => endpoint.href).join(",");
+	if (cachedProxyFetch?.key === key) return cachedProxyFetch.fetch;
+	const created = createMetaProxyFetch(endpoints.map((endpoint) => endpoint.href));
+	cachedProxyFetch = { key, fetch: created };
 	return created;
 }
 
-/** Test seam: forget the cached proxy transport. */
+/** Test seam: forget the cached proxy transport and its quarantine. */
 export function resetMetaProxyFetch(): void {
 	cachedProxyFetch = undefined;
 }
 
+interface MetaProxyEndpoint extends Required<Pick<ParsedMetaProxy, "href" | "display">> {
+	host: string;
+	port: number;
+	auth?: string;
+}
+
+function toEndpoint(parsed: Required<Pick<ParsedMetaProxy, "href" | "display">>): MetaProxyEndpoint {
+	const url = new URL(parsed.href);
+	return {
+		href: parsed.href,
+		display: parsed.display,
+		host: url.hostname,
+		port: Number(url.port || 80),
+		auth: url.username
+			? `Basic ${Buffer.from(
+					`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`,
+					"utf8",
+				).toString("base64")}`
+			: undefined,
+	};
+}
+
 /**
- * Builds a `fetch` that reaches `https://` targets through an HTTP `CONNECT`
- * proxy. Only the shapes pi-ai sends are supported (JSON string or byte body),
- * and response streams are handed back unbuffered so SSE reaches pi live.
+ * Builds a `fetch` that reaches `https://` targets through one of the given HTTP
+ * `CONNECT` proxies.
+ *
+ * Endpoints are tried in order; a transport failure (tunnel refused, TLS error,
+ * connect timeout) quarantines that endpoint for `META_PROXY_QUARANTINE_MS` and
+ * the next one is used, so a flaky exit costs one attempt instead of the turn.
+ * There is no permanent denylist: the quarantine expires and the endpoint is
+ * tried again. A proxy that answers *anything* (even `404`) is healthy — only
+ * failures before the first response byte count.
+ *
+ * Only the shapes pi-ai sends are supported (JSON string or byte body), and
+ * response streams are handed back unbuffered so SSE reaches pi live.
  */
-export function createMetaProxyFetch(proxyUrl: string): Fetch {
-	const proxy = new URL(proxyUrl);
-	if (proxy.protocol !== "http:") {
-		throw new Error(
-			`pi-meta: META_PROXY_URL must be an http:// CONNECT proxy, got ${proxy.protocol}`,
-		);
-	}
-	const proxyHost = proxy.hostname;
-	const proxyPort = Number(proxy.port || 80);
-	const proxyAuth = proxy.username
-		? `Basic ${Buffer.from(
-				`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
-				"utf8",
-			).toString("base64")}`
-		: undefined;
+export function createMetaProxyFetch(
+	proxyUrl: string | string[],
+	options: { now?: () => number } = {},
+): Fetch {
+	const now = options.now ?? Date.now;
+	const endpoints = (Array.isArray(proxyUrl) ? proxyUrl : [proxyUrl])
+		.map(parseMetaProxy)
+		.map((entry) => {
+			if (entry.error) throw new Error(entry.error);
+			return toEndpoint(entry as Required<Pick<ParsedMetaProxy, "href" | "display">>);
+		});
+	if (endpoints.length === 0) throw new Error("pi-meta: META_PROXY is empty");
+
+	const quarantineUntil = new Map<string, number>();
+
+	const ordered = (at: number): MetaProxyEndpoint[] => {
+		const ready: MetaProxyEndpoint[] = [];
+		const cooling: MetaProxyEndpoint[] = [];
+		for (const endpoint of endpoints) {
+			((quarantineUntil.get(endpoint.href) ?? 0) <= at ? ready : cooling).push(endpoint);
+		}
+		// Quarantined endpoints come back only when nothing else is left: a bad
+		// minute must not kill the turn, and a working endpoint must not be
+		// skipped for a cooling one.
+		return ready.length > 0 ? ready : cooling;
+	};
 
 	const proxied = async (
 		input: Parameters<Fetch>[0],
@@ -945,35 +1087,62 @@ export function createMetaProxyFetch(proxyUrl: string): Fetch {
 
 		const targetPort = Number(target.port || 443);
 		const signal = init?.signal ?? undefined;
-		const tunnel = await openProxyTunnel({
-			proxyHost,
-			proxyPort,
-			proxyAuth,
-			targetHost: target.hostname,
-			targetPort,
-			signal,
-		});
-		const secured = await startTunnelTls(tunnel, target.hostname, signal);
-		const { request } = await import("node:http");
-		const { Readable } = await import("node:stream");
+		let lastError: unknown;
+		for (const endpoint of ordered(now())) {
+			if (signal?.aborted) break;
+			try {
+				const tunnel = await openProxyTunnel({
+					proxyHost: endpoint.host,
+					proxyPort: endpoint.port,
+					proxyAuth: endpoint.auth,
+					targetHost: target.hostname,
+					targetPort,
+					signal,
+				});
+				const secured = await startTunnelTls(tunnel, target.hostname, signal);
+				quarantineUntil.delete(endpoint.href);
+				return await sendOverTunnel(secured, target, headers, payload, init, signal);
+			} catch (error) {
+				// A response was never received, so the endpoint is the suspect.
+				quarantineUntil.set(endpoint.href, now() + META_PROXY_QUARANTINE_MS);
+				lastError = error;
+			}
+		}
+		throw lastError ?? new Error("pi-meta: no proxy endpoint could be used");
+	};
 
-		return await new Promise<Response>((resolve, reject) => {
-			const req = request(
-				{
-					method: (init?.method ?? "GET").toUpperCase(),
-					path: `${target.pathname}${target.search}`,
-					headers: { ...Object.fromEntries(headers), host: target.hostname },
-					// The TLS layer is already open, so plain HTTP/1.1 rides on top of it.
-					createConnection: () => secured,
-					...(signal ? { signal } : {}),
-				},
-				(res) => {
-					const responseHeaders = new Headers();
-					for (const [name, value] of Object.entries(res.headers)) {
-						if (value === undefined) continue;
-						if (Array.isArray(value)) for (const entry of value) responseHeaders.append(name, entry);
-						else responseHeaders.set(name, value);
-					}
+	// Bun's `fetch` type carries `preconnect`; the tunnel has no connection pool.
+	return proxied as Fetch;
+}
+
+async function sendOverTunnel(
+	secured: import("node:tls").TLSSocket,
+	target: URL,
+	headers: Headers,
+	payload: Uint8Array | undefined,
+	init: Parameters<Fetch>[1],
+	signal: AbortSignal | undefined,
+): Promise<Response> {
+	const { request } = await import("node:http");
+	const { Readable } = await import("node:stream");
+	return await new Promise<Response>((resolve, reject) => {
+		const req = request(
+			{
+				method: (init?.method ?? "GET").toUpperCase(),
+				path: `${target.pathname}${target.search}`,
+				headers: { ...Object.fromEntries(headers), host: target.hostname },
+				// The TLS layer is already open, so plain HTTP/1.1 rides on top of it.
+				createConnection: () => secured,
+				...(signal ? { signal } : {}),
+			},
+			(res) => {
+				const responseHeaders = new Headers();
+				for (const [name, value] of Object.entries(res.headers)) {
+					if (value === undefined) continue;
+					if (Array.isArray(value))
+						for (const entry of value) responseHeaders.append(name, entry);
+					else responseHeaders.set(name, value);
+				}
 				resolve(
 					new Response(
 						Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>,
@@ -984,15 +1153,11 @@ export function createMetaProxyFetch(proxyUrl: string): Fetch {
 						},
 					),
 				);
-				},
-			);
-			req.on("error", reject);
-			req.end(payload ? Buffer.from(payload) : undefined);
-		});
-	};
-
-	// Bun's `fetch` type carries `preconnect`; the tunnel has no connection pool.
-	return proxied as Fetch;
+			},
+		);
+		req.on("error", reject);
+		req.end(payload ? Buffer.from(payload) : undefined);
+	});
 }
 
 interface ProxyTunnelRequest {
@@ -1876,7 +2041,7 @@ export function streamMetaSimple(
 	const config = deps.config ?? DEFAULT_META_RETRY;
 	const enabled = deps.enabled ?? metaTransportRetryEnabled(deps.env);
 	const sleep = deps.sleep ?? interruptibleRetrySleep;
-	// `META_PROXY_URL` keeps the detour provider-scoped: pi's own proxy is a
+	// `META_PROXY` keeps the detour provider-scoped: pi's own proxy is a
 	// process-wide dispatcher that also reroutes every other provider.
 	const proxied = metaProxyFetch(deps.env);
 	const requestOptions: MetaStreamOptions = proxied
@@ -2076,11 +2241,19 @@ export function startLiveCatalogRefresh(
 				META_PROVIDER_ID,
 			))?.auth?.apiKey;
 			if (!apiKey || signal.aborted) return;
-			const models = await fetchMetaCatalog(
-				apiKey,
-				metaProxyFetch() ?? fetch,
-				signal,
-			);
+			// A malformed META_PROXY must be visible at startup, not only when a
+			// turn fails: there is no notify at registration, so warn from here.
+			let transport: Fetch;
+			try {
+				transport = metaProxyFetch() ?? fetch;
+			} catch (error) {
+				metaStreamState.notify?.(
+					error instanceof Error ? error.message : String(error),
+					"warning",
+				);
+				return;
+			}
+			const models = await fetchMetaCatalog(apiKey, transport, signal);
 			if (signal.aborted) return;
 			if (models.length === 0) {
 				noteMetaCatalogResult(models);

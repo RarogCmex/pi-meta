@@ -75,7 +75,7 @@ describe("Meta OAuth provider", () => {
 	// tests so store-restore assertions see only their own fixture.
 	beforeEach(() => {
 		// Hermetic: a proxy in the developer shell must not reroute a stubbed test.
-		delete process.env["META_PROXY_URL"];
+		delete process.env["META_PROXY"];
 		resetMetaProxyFetch();
 		resetCatalogRefreshState();
 	});

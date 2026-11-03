@@ -193,7 +193,7 @@ live cache probe without any env. Checks that were run on 2026-10-11:
   (raw curl: 12/12 ok, then 16/16 404, then 3/6 404, then 6/6 404). Always
   re-measure with a raw curl before blaming the extension for a 404.
 
-## Geography gate and META_PROXY_URL
+## Geography gate and META_PROXY
 
 Meta gates the Model API by exit geography, and the gate is silent. Measured
 2026-11-03 from a Georgian residential line with a key that works elsewhere:
@@ -202,18 +202,32 @@ direct** and **8/8 `200` through a US residential exit**; `GET /v1/models`
 answers `200 {"data":[]}` on the gated exit. The key stays valid — no key at all
 is `401 invalid_api_key`, a gated key is a 404 that looks like a typo.
 
-`META_PROXY_URL` (an `http://` CONNECT proxy) is the provider-scoped way out:
-`createMetaProxyFetch()` opens the tunnel, speaks HTTP/1.1 over it, streams the
-response unbuffered (SSE reaches pi live) and is applied to `streamSimple` and to
-the catalog fetch. Do **not** reach for `HTTPS_PROXY` / the `httpProxy` setting
-first: pi installs one process-wide `EnvHttpProxyAgent`, so every provider takes
-the detour — measured: NVIDIA answers `403` through the same exit.
+`META_PROXY` (one `http://` CONNECT proxy) and `META_PROXIES` (comma-separated,
+wins over `META_PROXY`) are the provider-scoped way out — the same split
+`pi-nvidia-plus` uses for `NVIDIA_NIM_PROXY` / `NVIDIA_NIM_PROXIES`, minus the
+file source. `parseMetaProxy()` accepts `http://host:port`, `host:port` and the
+`host:port:user:pass` line a seller prints, refusing `https://` (TLS to the
+proxy) and SOCKS by name. `createMetaProxyFetch()` opens the tunnel, speaks
+HTTP/1.1 over it, streams the response unbuffered (SSE reaches pi live) and is
+applied to `streamSimple` and to the catalog fetch.
+
+With several endpoints each request walks them in order; a failure *before* the
+first response byte quarantines that endpoint for `META_PROXY_QUARANTINE_MS`
+(60 s, no lasting denylist) and the next one is used, so a flaky exit costs one
+attempt. A proxy that answers anything — even `404` — is healthy. When every
+endpoint is cooling they are all retried rather than failing the turn.
+
+Do **not** reach for `HTTPS_PROXY` / the `httpProxy` setting first: pi installs
+one process-wide `EnvHttpProxyAgent`, so every provider takes the detour —
+measured: NVIDIA answers `403` through the same exit.
 
 Verified end to end with the operator's keys and a Verizon residential exit:
-`META_PROXY_URL=… pi -p -ne -e ./extensions/meta.ts --model meta/muse-spark-1.3`
-→ `pong` in 3–4 s, a tool-calling turn through `muse-wonder-1.0`, and `bun test`
-97 pass / 1 skip / 0 fail with the env set (the hermetic suites clear
-`META_PROXY_URL` in `beforeEach`; the live probe uses it when present).
+`META_PROXY=… pi -p -ne -e ./extensions/meta.ts --model meta/muse-spark-1.3`
+→ `pong` in 3–4 s, a tool-calling turn through `muse-wonder-1.0`, and
+`META_PROXIES=<dead exit>,<live exit>` → `pong` in 3.6 s while the first endpoint
+refuses the tunnel. `bun test` 104 pass / 1 skip / 0 fail with and without the
+env (the hermetic suites clear `META_PROXY`/`META_PROXIES` in `beforeEach`; the
+live probe uses them when present).
 
 Key hygiene learned in the same session: keys minted for a team with an
 unsettled bill answer `402 billing_not_configured` (they look healthy until a

@@ -74,12 +74,26 @@ empty `data: []`, and every chat id answers `404 model_not_found`. Measured
 404 direct, 8/8 calls 200 behind a US residential exit**. Nothing in the error
 says "wrong country", so it reads exactly like a dead key.
 
-Set `META_PROXY_URL` to an HTTP `CONNECT` proxy and the extension tunnels
-*only* Meta's traffic through it:
+Set `META_PROXY` to an HTTP `CONNECT` proxy and the extension tunnels *only*
+Meta's traffic through it:
 
 ```bash
-META_PROXY_URL=http://user:pass@host:3128 pi
+META_PROXY=http://user:pass@host:3128 pi
+META_PROXY=host:3128:user:pass pi          # the line a seller prints
+META_PROXIES=dead:3128:u:p,live:3128:u:p pi  # first working one wins
 ```
+
+Same shape as `NVIDIA_NIM_PROXY` / `NVIDIA_NIM_PROXIES` in `pi-nvidia-plus`,
+minus the file source: `META_PROXIES` (comma-separated) wins over `META_PROXY`,
+the scheme may be omitted, and credentials ride in the userinfo or in the
+`host:port:user:pass` form. Only `http://` CONNECT proxies are supported;
+`https://` (TLS to the proxy) and SOCKS are refused by name.
+
+With several endpoints each request tries them in order, and an endpoint that
+fails before the first response byte is quarantined for 60 s and skipped — a
+flaky exit costs one attempt instead of the turn. A proxy that answers *anything*
+(even `404`) is healthy and keeps its place. When every endpoint is cooling, they
+are all tried anyway rather than failing the turn.
 
 Use this instead of `HTTPS_PROXY` (or the `httpProxy` setting) when only Meta
 needs the detour: pi's proxy is one process-wide dispatcher, so it reroutes

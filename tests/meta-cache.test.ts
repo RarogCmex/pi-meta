@@ -103,7 +103,7 @@ async function liveCatalogIds(apiKey: string): Promise<string[] | undefined> {
 /**
  * Meta gates the Model API by exit geography (measured 2026-11-03: a working
  * key sees an empty catalog from this host and completions behind a US
- * residential exit). `META_PROXY_URL` is the provider-scoped way out, so the
+ * residential exit). `META_PROXY` is the provider-scoped way out, so the
  * live probe uses it whenever it is set instead of failing on the gate.
  */
 function liveFetch(): typeof fetch {
@@ -186,9 +186,9 @@ async function captureResponsesRequest(options?: {
 }
 
 describe("Meta Responses cache and reasoning contracts", () => {
-	// Hermetic: the live probe below wants META_PROXY_URL, the contract tests do not.
+	// Hermetic: the live probe below wants META_PROXY, the contract tests do not.
 	beforeEach(() => {
-		delete process.env["META_PROXY_URL"];
+		delete process.env["META_PROXY"];
 		resetMetaProxyFetch();
 	});
 
@@ -599,6 +599,45 @@ describe("Meta Responses cache and reasoning contracts", () => {
 		}
 	});
 
+	// A malformed META_PROXY is a configuration error, not a silent no-op: the
+	// startup pass must warn through the UI and leave the provider registered.
+	test("warns on session start when META_PROXY cannot be parsed", async () => {
+		resetCatalogRefreshState();
+		const handlers = new Map<string, unknown>();
+		metaOAuthProvider({
+			registerProvider() {},
+			on(event: string, next: unknown) {
+				handlers.set(event, next);
+			},
+		} as unknown as ExtensionAPI);
+		const sessionStart = handlers.get("session_start") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		const notices: string[] = [];
+		process.env["META_PROXY"] = "socks5://127.0.0.1:1080";
+		try {
+			await sessionStart?.(
+				{ type: "session_start", reason: "startup" },
+				{
+					hasUI: true,
+					ui: {
+						notify: (message: string) => notices.push(message),
+					},
+					modelRegistry: {
+						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
+					},
+				},
+			);
+			const deadline = Date.now() + 5_000;
+			while (notices.length === 0 && Date.now() < deadline) {
+				await Bun.sleep(20);
+			}
+		} finally {
+			delete process.env["META_PROXY"];
+		}
+		expect(notices.join("\n")).toContain("must be an http:// CONNECT proxy");
+	});
+
 	test("requests the live catalog on session start", async () => {
 		resetCatalogRefreshState();
 		const handlers = new Map<string, unknown>();
@@ -755,11 +794,11 @@ describe("Meta live prompt-cache probe", () => {
 			const reachable = await liveCatalogIds(liveApiKey);
 			if (reachable !== undefined && reachable.length === 0) {
 				// The gateway lists no model for this key from this exit. That is the
-				// geography gate (META_PROXY_URL), not a cache measurement: there is
+				// geography gate (META_PROXY), not a cache measurement: there is
 				// nothing to cache against, and asserting the 404 here would make the
 				// probe red on every host behind that gate.
 				console.warn(
-					"pi-meta cache probe: the catalog is empty (geography gate?) — nothing to measure; set META_PROXY_URL to run it",
+					"pi-meta cache probe: the catalog is empty (geography gate?) — nothing to measure; set META_PROXY to run it",
 				);
 				return;
 			}
@@ -788,7 +827,7 @@ describe("Meta live prompt-cache probe", () => {
 				// (measured 2026-11-03: 8/8 404 direct, 8/8 200 through a US exit).
 				// Caching is not measurable from here, and it is not a cache bug.
 				console.warn(
-					"pi-meta cache probe: this exit cannot reach the model (404 model_not_found) — set META_PROXY_URL to run it",
+					"pi-meta cache probe: this exit cannot reach the model (404 model_not_found) — set META_PROXY to run it",
 				);
 				return;
 			}
