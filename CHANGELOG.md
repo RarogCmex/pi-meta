@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-11-03
+
+Re-verified against pi 1.5.0 / pi-ai 1.5.0 offline (2026-11-03): `bun run typecheck`
+clean (the repo's pinned TypeScript 5.9.3), `bun test` **89 pass / 2 skip / 0 fail**
+(both live probes skipped — the billable Meta probes need a live key and were not
+run), and `META_API_KEY=dead pi --offline -ne -e ./extensions/meta.ts --list-models meta`
+in an isolated `PI_CODING_AGENT_DIR` prints all six pinned ids at 131.1K max-out.
+
+### Changed
+
+- `devDependencies` re-pinned to pi/pi-ai **1.5.0** (from 1.4.0) and `bun.lock`
+  regenerated. No code changes were needed: this provider imports only types and
+  `streamSimple`/`normalizeContext` from pi-ai, and the 1.5.0 break that did bite
+  other packages — pi-ai no longer re-exporting TypeBox's `Type` — is not imported
+  here. The 1.5.0 package-changelog feature is now live for this package: pi reads
+  the root `CHANGELOG.md` by default, so `pi.changelogPath` is not set.
+- The rest of the 1.5.0 feature matrix does not reach this provider: the
+  tool-schema change is moot (no tools are registered),
+  `Usage.cost.totalFromProvider` and `responseModel` are filled by the host runtime,
+  `keyText()`/`keyHint()` need a custom tool renderer, `blocked` on
+  `ctx.ui.custom()` needs an inline custom UI, `pi.exec()` is never called, and the
+  GPT-6.1 Terra / models.dev v2 / default-model swaps are host catalogs. The Meta
+  catalog is unchanged between 1.4.0 and 1.5.0: the parity test still passes
+  against the 1.5.0 bundle (same six chat ids, same 131072 max-out and image-resize
+  box).
+
 ## [0.10.0] - 2026-10-22
 
 Re-verified against pi / pi-ai **1.4.0** offline; the billable live probes were deliberately not run (no `meta` credential is present in this environment's `~/.pi/agent/auth.json` anymore, so `bun test` skips them on its own).
