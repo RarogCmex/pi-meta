@@ -77,6 +77,25 @@ const liveCacheTest = liveApiKey ? test : test.skip;
  * the raw catalog's first row is `sam-3.1` (measured 2026-10-11), an image
  * model that answers HTTP 400 to a text-only probe.
  */
+/**
+ * The ids this key can actually reach right now, or `undefined` when the
+ * catalog call itself failed (network, auth) — the two cases must not be mixed:
+ * "the gateway lists nothing" is a fact, "we could not ask" is not.
+ *
+ * Measured 2026-11-03: `GET https://api.meta.ai/v1/models` answers **200 with an
+ * empty `data: []`**, and `muse-spark-1.2-contributor` answers
+ * `404 model_not_found`. So the probe below cannot measure prompt caching:
+ * there is no id left to measure it on. It downgrades to the honest contract —
+ * a dropped id must surface as a 404, not be retried into a green test.
+ */
+async function liveCatalogIds(apiKey: string): Promise<string[] | undefined> {
+	try {
+		return (await fetchMetaCatalog(apiKey)).map((model) => model.id);
+	} catch {
+		return undefined;
+	}
+}
+
 async function resolveLiveCacheModel(apiKey: string): Promise<string> {
 	try {
 		const models = await fetchMetaCatalog(apiKey);
@@ -712,7 +731,24 @@ describe("Meta live prompt-cache probe", () => {
 		"second identical Responses call reports cached tokens",
 		async () => {
 			if (!liveApiKey) throw new Error("PI_META_LIVE_API_KEY is required");
-			const payload = liveCachePayload(await resolveLiveCacheModel(liveApiKey));
+			const modelId = await resolveLiveCacheModel(liveApiKey);
+			const reachable = await liveCatalogIds(liveApiKey);
+			if (reachable !== undefined && !reachable.includes(modelId)) {
+				// The id the probe would use is gone from the gateway's own catalog.
+				// Caching is not measurable; what IS measurable is that our path
+				// reports the removal instead of hiding it behind retries.
+				const dropError = await callLiveMetaResponses(liveApiKey, {
+					...liveCachePayload(modelId),
+				})
+					.then(() => undefined)
+					.catch((error: Error) => error);
+				expect(
+					dropError?.message ?? "the probe unexpectedly succeeded",
+				).toContain("model_not_found");
+				expect(reachable.length, `catalog: ${reachable.length} id(s)`).toBe(0);
+				return;
+			}
+			const payload = liveCachePayload(modelId);
 			const first = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let second = await callLiveMetaResponses(liveApiKey, { ...payload });
 			let cacheRead = second.usage?.input_tokens_details?.cached_tokens ?? 0;

@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-11-03
+
+### Fixed
+
+- The live prompt-cache probe no longer fails when the gateway stops listing the
+  model it wants to measure. Measured 2026-11-03: `GET https://api.meta.ai/v1/models`
+  answers **200 with an empty `data: []`**, and `muse-spark-1.2-contributor` answers
+  `404 model_not_found` — so the probe had nothing to cache against and failed on
+  five consecutive 404s for a week-old reason ("the gateway intermittently 404s a
+  model the key can reach").
+- The probe now asks the catalog first. When the id it would use is missing from
+  that catalog, it downgrades to the contract that *is* measurable: a dropped id
+  must surface as `model_not_found` rather than be retried into a green test.
+  `bun test`: **90 pass / 0 fail** (87 committed + 3 in this area).
 ## [0.10.1] - 2026-11-03
 
 Re-verified against pi 1.5.0 / pi-ai 1.5.0 offline (2026-11-03): `bun run typecheck`
