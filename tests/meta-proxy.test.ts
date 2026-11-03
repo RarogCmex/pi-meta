@@ -1,16 +1,23 @@
 /// <reference types="bun-types" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
+import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
 import type { AddressInfo } from "node:net";
 
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import {
+	bindMetaStreamState,
 	createMetaProxyFetch,
 	META_PROXY_QUARANTINE_MS,
 	metaProxyEndpoints,
 	metaProxyFetch,
 	metaProxySources,
 	parseMetaProxy,
+	resetMetaProxyFailure,
 	resetMetaProxyFetch,
+	resetMetaProxyNotices,
+	resetMetaStreamState,
+	streamMetaSimple,
 } from "../extensions/meta.ts";
 
 /**
@@ -23,10 +30,14 @@ import {
  * `NVIDIA_NIM_PROXIES`, minus the file source.
  */
 const servers: Server[] = [];
+const tcpServers: TcpServer[] = [];
 
 afterEach(() => {
 	for (const server of servers.splice(0)) server.close();
 	resetMetaProxyFetch();
+	resetMetaProxyNotices();
+	resetMetaProxyFailure();
+	resetMetaStreamState();
 	delete process.env["META_PROXY"];
 	delete process.env["META_PROXIES"];
 });
@@ -165,6 +176,25 @@ describe("META_PROXY transport", () => {
 
 	// Measured with the operator's two exits: one answered 8/8, the other dropped
 	// two of three requests. A dead exit must cost one attempt, not the turn.
+	// A dead exit that swallows the connection used to hang the turn until pi's
+	// own timeout; measured 90 s on a closed residential port.
+	test("gives up on an exit that never answers the CONNECT", async () => {
+		const silent = createTcpServer(() => {});
+		tcpServers.push(silent);
+		const port = await new Promise<number>((resolve) => {
+			silent.listen(0, "127.0.0.1", () =>
+				resolve((silent.address() as AddressInfo).port),
+			);
+		});
+		const proxied = createMetaProxyFetch(`127.0.0.1:${port}`, {
+			connectTimeoutMs: 80,
+		});
+
+		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow(
+			"timed out after 80 ms",
+		);
+	});
+
 	test("falls through to the next endpoint when one refuses the tunnel", async () => {
 		const dead = await startProxy(() => 502);
 		const alive = await startProxy(() => 403);
@@ -202,6 +232,96 @@ describe("META_PROXY transport", () => {
 		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow();
 		expect(dead.see).toHaveLength(3);
 		expect(alive.see).toHaveLength(3);
+	});
+
+	// A dead exit must be visible in the UI: otherwise the user reads the failed
+	// turn as "Meta is broken" while the real cause is a proxy nobody mentioned.
+	test("warns when the only endpoint refuses the tunnel", async () => {
+		const notices: Array<{ message: string; type: string }> = [];
+		bindMetaStreamState({
+			notify: (message, type) => notices.push({ message, type }),
+		});
+		const proxy = await startProxy(() => 502);
+		const proxied = createMetaProxyFetch(proxy.url);
+
+		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow();
+
+		const text = notices.map((notice) => notice.message).join("\n");
+		expect(text).toContain(`proxy 127.0.0.1:${new URL(proxy.url).port} failed`);
+		expect(text).toContain("no endpoint left");
+		expect(text).toContain("no proxy endpoint is reachable");
+		expect(text).toContain("META_PROXY");
+		expect(notices.some((notice) => notice.type === "error")).toBe(true);
+	});
+
+	test("names the endpoint it falls back to", async () => {
+		const notices: string[] = [];
+		bindMetaStreamState({ notify: (message) => notices.push(message) });
+		const dead = await startProxy(() => 500);
+		const alive = await startProxy(() => 403);
+		const proxied = createMetaProxyFetch([dead.url, alive.url]);
+
+		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow();
+
+		expect(notices.join("\n")).toContain(
+			`trying the next endpoint (127.0.0.1:${new URL(alive.url).port})`,
+		);
+	});
+
+	test("does not repeat the same warning on every request", async () => {
+		const notices: string[] = [];
+		bindMetaStreamState({ notify: (message) => notices.push(message) });
+		const proxy = await startProxy(() => 502);
+		const proxied = createMetaProxyFetch(proxy.url);
+
+		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow();
+		await expect(proxied("https://api.meta.ai/v1/models")).rejects.toThrow();
+
+		// One "endpoint failed" plus one "nothing reachable", not four.
+		expect(notices).toHaveLength(2);
+	});
+
+	// pi retries whatever its classifier believes is transient, and the raw socket
+	// error ("getaddrinfo ENOTFOUND …") is in that set — measured: a dead exit
+	// against this host's `retry.maxRetries: 10` hung for 90 s. The message the
+	// retry layer emits must therefore be one pi stops on.
+	test("a dead proxy ends the turn with a message pi will not retry", async () => {
+		const model = {
+			id: "muse-spark-1.3",
+			name: "Muse Spark 1.3",
+			provider: "meta",
+			api: "openai-responses",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: true,
+			input: ["text"],
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+		} as never;
+		const context = {
+			messages: [{ role: "user", content: "say pong" }],
+		} as never;
+
+		const stream = streamMetaSimple(
+			model,
+			context,
+			{
+				apiKey: "dead-exit",
+				fetch: createMetaProxyFetch("127.0.0.1:9:u:p", {
+					connectTimeoutMs: 200,
+				}),
+			},
+			{ config: { maxRetries: 0, minDelayMs: 1, maxDelayMs: 1 } },
+		);
+
+		let terminal: { type?: string; error?: unknown } = {};
+		for await (const event of stream) terminal = event as never;
+
+		expect(terminal.type).toBe("error");
+		const message = (terminal as { error: { errorMessage?: string } }).error;
+		expect(message.errorMessage).toContain("META_PROXY endpoint");
+		expect(message.errorMessage).toContain("META_PROXY/META_PROXIES");
+		expect(isRetryableAssistantError(message as never)).toBe(false);
 	});
 
 	test("a proxy that answers anything is healthy, whatever the status", async () => {

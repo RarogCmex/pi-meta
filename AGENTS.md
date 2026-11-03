@@ -215,7 +215,22 @@ With several endpoints each request walks them in order; a failure *before* the
 first response byte quarantines that endpoint for `META_PROXY_QUARANTINE_MS`
 (60 s, no lasting denylist) and the next one is used, so a flaky exit costs one
 attempt. A proxy that answers anything — even `404` — is healthy. When every
-endpoint is cooling they are all retried rather than failing the turn.
+endpoint is cooling they are all retried rather than failing the turn. Reaching
+an exit is capped at `META_PROXY_CONNECT_TIMEOUT_MS` (10 s, CONNECT + TLS): a
+closed residential port used to burn the whole 90 s turn budget.
+
+Failures are surfaced, not swallowed. A dead endpoint raises a warning naming it
+(`pi-meta: proxy <display> failed (…) — trying the next endpoint (<display>)`),
+the exhausted list raises an error, and both are deduped on the quarantine
+window. The turn itself ends with
+`pi-meta: META_PROXY endpoint <display> is unusable — <reason>. Check
+META_PROXY/META_PROXIES …`. **That wording is load-bearing**: pi retries
+whatever `isRetryableAssistantError` calls transient, and the raw socket text
+(`getaddrinfo ENOTFOUND …`) is in that set — measured on this host,
+`retry.maxRetries: 10` turned a DNS typo into a 90 s hang. `describeProxyFailure()`
+maps codes to sentences that classifier rejects; the assertion lives in
+`tests/meta-proxy.test.ts` ("a dead proxy ends the turn with a message pi will
+not retry").
 
 Do **not** reach for `HTTPS_PROXY` / the `httpProxy` setting first: pi installs
 one process-wide `EnvHttpProxyAgent`, so every provider takes the detour —

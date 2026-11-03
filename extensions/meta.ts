@@ -885,6 +885,14 @@ export interface ParsedMetaProxy {
 /** CONNECT/TLS failures quarantine an endpoint for this long, then retry it. */
 export const META_PROXY_QUARANTINE_MS = 60_000;
 
+/**
+ * Ceiling for reaching an exit (CONNECT answer + TLS handshake). A dead endpoint
+ * that swallows the SYN would otherwise hang the turn until pi's own timeout —
+ * measured: a closed port on a residential proxy burned the full 90 s budget
+ * before the layer had a say. `pi-nvidia-plus` uses the same order (10 s probes).
+ */
+export const META_PROXY_CONNECT_TIMEOUT_MS = 10_000;
+
 function redactProxyValue(value: string): string {
 	return value.replace(/\/\/[^/@]*@/, "//***@");
 }
@@ -1017,6 +1025,131 @@ function toEndpoint(parsed: Required<Pick<ParsedMetaProxy, "href" | "display">>)
 }
 
 /**
+ * Proxy failures are the one class of error the user must see live: a dead exit
+ * otherwise reads as "Meta is broken" while the turn fails silently in the
+ * background. Both notices are deduped on the quarantine window so a retry loop
+ * cannot turn them into a stream.
+ */
+const proxyNoticeState = new Map<string, number>();
+
+function proxyNoticeOnce(key: string, now: number): boolean {
+	const last = proxyNoticeState.get(key);
+	if (last !== undefined && now - last < META_PROXY_QUARANTINE_MS) return false;
+	if (proxyNoticeState.size >= 64) {
+		for (const [entry, at] of proxyNoticeState) {
+			if (now - at >= META_PROXY_QUARANTINE_MS) proxyNoticeState.delete(entry);
+		}
+		if (proxyNoticeState.size >= 64) proxyNoticeState.clear();
+	}
+	proxyNoticeState.set(key, now);
+	return true;
+}
+
+/**
+ * Turns a transport error into a sentence pi will not retry.
+ *
+ * The raw text cannot be pasted in: pi's classifier reads the message, and
+ * `getaddrinfo ENOTFOUND …` lands in its retryable set (measured), which is how a
+ * DNS typo became a 90 s hang against `retry.maxRetries: 10`. Every phrasing
+ * below is asserted non-retryable in `tests/meta-proxy.test.ts`.
+ */
+function describeProxyFailure(message: string): string {
+	const status = /CONNECT refused with HTTP (\d+)/i.exec(message);
+	if (status) return `the proxy answered CONNECT with HTTP ${status[1]}`;
+	if (/ENOTFOUND|EAI_AGAIN/i.test(message))
+		return "the proxy host name does not resolve";
+	if (/ECONNREFUSED/i.test(message))
+		return "the proxy refused the TCP connection";
+	if (/ECONNRESET|EPIPE/i.test(message)) return "the proxy dropped the socket";
+	if (/timed out|ETIMEDOUT|Timeout/i.test(message))
+		return "the proxy did not answer in time";
+	return "the tunnel could not be established";
+}
+
+function proxyErrorMessage(failure: {
+	display: string;
+	message: string;
+}): string {
+	return `pi-meta: META_PROXY endpoint ${failure.display} is unusable — ${describeProxyFailure(failure.message)}. Check META_PROXY/META_PROXIES (see README); this request never reached Meta.`;
+}
+
+function briefProxyError(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.length > 160 ? `${message.slice(0, 157)}…` : message;
+}
+
+function notifyProxyDown(
+	display: string,
+	error: unknown,
+	next: string,
+	now: number,
+): void {
+	if (!proxyNoticeOnce(`down:${display}`, now)) return;
+	metaStreamState.notify?.(
+		`pi-meta: proxy ${display} failed (${briefProxyError(error)}) — ${next}`,
+		"warning",
+	);
+}
+
+function notifyProxyExhausted(
+	displays: string[],
+	error: unknown,
+	now: number,
+): void {
+	if (!proxyNoticeOnce("exhausted", now)) return;
+	metaStreamState.notify?.(
+		`pi-meta: no proxy endpoint is reachable (tried ${displays.join(", ") || "none"}) — ${briefProxyError(error ?? "unknown error")}. Check META_PROXY / META_PROXIES.`,
+		"error",
+	);
+}
+
+/** Test seam: drop the proxy notice dedupe. */
+export function resetMetaProxyNotices(): void {
+	proxyNoticeState.clear();
+}
+
+/**
+ * The last transport-level proxy failure, kept so the retry layer can name it.
+ *
+ * pi-ai folds a failed `fetch` into the generic `Connection error.`, which pi
+ * then retries with the agent-level budget (measured: `retry.maxRetries: 10` on
+ * this host turned a dead exit into a 90 s hang). Naming the proxy instead gives
+ * pi a message its classifier treats as terminal, and the user the one fact that
+ * matters.
+ */
+const proxyFailureState: {
+	display?: string;
+	message?: string;
+	at?: number;
+} = {};
+
+const PROXY_FAILURE_TTL_MS = 10_000;
+
+function noteProxyFailure(display: string, error: unknown): void {
+	proxyFailureState.display = display;
+	proxyFailureState.message = briefProxyError(error);
+	proxyFailureState.at = Date.now();
+}
+
+/** The endpoint that just failed, while the failure is still relevant. */
+export function lastMetaProxyFailure(
+	now: number = Date.now(),
+): { display: string; message: string } | undefined {
+	const { display, message, at } = proxyFailureState;
+	if (display === undefined || message === undefined || at === undefined)
+		return undefined;
+	if (now - at > PROXY_FAILURE_TTL_MS) return undefined;
+	return { display, message };
+}
+
+/** Test seam: forget the last proxy failure. */
+export function resetMetaProxyFailure(): void {
+	delete proxyFailureState.display;
+	delete proxyFailureState.message;
+	delete proxyFailureState.at;
+}
+
+/**
  * Builds a `fetch` that reaches `https://` targets through one of the given HTTP
  * `CONNECT` proxies.
  *
@@ -1032,9 +1165,11 @@ function toEndpoint(parsed: Required<Pick<ParsedMetaProxy, "href" | "display">>)
  */
 export function createMetaProxyFetch(
 	proxyUrl: string | string[],
-	options: { now?: () => number } = {},
+	options: { now?: () => number; connectTimeoutMs?: number } = {},
 ): Fetch {
 	const now = options.now ?? Date.now;
+	const connectTimeoutMs =
+		options.connectTimeoutMs ?? META_PROXY_CONNECT_TIMEOUT_MS;
 	const endpoints = (Array.isArray(proxyUrl) ? proxyUrl : [proxyUrl])
 		.map(parseMetaProxy)
 		.map((entry) => {
@@ -1087,8 +1222,9 @@ export function createMetaProxyFetch(
 
 		const targetPort = Number(target.port || 443);
 		const signal = init?.signal ?? undefined;
+		const candidates = ordered(now());
 		let lastError: unknown;
-		for (const endpoint of ordered(now())) {
+		for (const [index, endpoint] of candidates.entries()) {
 			if (signal?.aborted) break;
 			try {
 				const tunnel = await openProxyTunnel({
@@ -1098,16 +1234,40 @@ export function createMetaProxyFetch(
 					targetHost: target.hostname,
 					targetPort,
 					signal,
+					timeoutMs: connectTimeoutMs,
 				});
-				const secured = await startTunnelTls(tunnel, target.hostname, signal);
+				const secured = await startTunnelTls(
+					tunnel,
+					target.hostname,
+					signal,
+					connectTimeoutMs,
+				);
 				quarantineUntil.delete(endpoint.href);
 				return await sendOverTunnel(secured, target, headers, payload, init, signal);
 			} catch (error) {
 				// A response was never received, so the endpoint is the suspect.
 				quarantineUntil.set(endpoint.href, now() + META_PROXY_QUARANTINE_MS);
 				lastError = error;
+				const next = candidates[index + 1];
+				notifyProxyDown(
+					endpoint.display,
+					error,
+					next
+						? `trying the next endpoint (${next.display})`
+						: "no endpoint left",
+					now(),
+				);
 			}
 		}
+		notifyProxyExhausted(
+			candidates.map((endpoint) => endpoint.display),
+			lastError,
+			now(),
+		);
+		noteProxyFailure(
+			candidates[candidates.length - 1]?.display ?? "unknown endpoint",
+			lastError,
+		);
 		throw lastError ?? new Error("pi-meta: no proxy endpoint could be used");
 	};
 
@@ -1167,6 +1327,7 @@ interface ProxyTunnelRequest {
 	targetHost: string;
 	targetPort: number;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 async function openProxyTunnel(
@@ -1174,6 +1335,7 @@ async function openProxyTunnel(
 ): Promise<import("node:net").Socket> {
 	const { request } = await import("node:http");
 	const authority = `${options.targetHost}:${options.targetPort}`;
+	const timeoutMs = options.timeoutMs ?? META_PROXY_CONNECT_TIMEOUT_MS;
 	return await new Promise((resolve, reject) => {
 		const req = request({
 			host: options.proxyHost,
@@ -1188,19 +1350,33 @@ async function openProxyTunnel(
 			},
 			...(options.signal ? { signal: options.signal } : {}),
 		});
+		const timer = setTimeout(() => {
+			req.destroy();
+			reject(
+				new Error(
+					`pi-meta: proxy CONNECT to ${authority} timed out after ${timeoutMs} ms`,
+				),
+			);
+		}, timeoutMs);
+		const settle = (fn: () => void): void => {
+			clearTimeout(timer);
+			fn();
+		};
 		req.on("connect", (res, socket) => {
 			if (res.statusCode !== 200) {
 				socket.destroy();
-				reject(
-					new Error(
-						`pi-meta: proxy CONNECT refused with HTTP ${res.statusCode ?? 0}`,
+				settle(() =>
+					reject(
+						new Error(
+							`pi-meta: proxy CONNECT refused with HTTP ${res.statusCode ?? 0}`,
+						),
 					),
 				);
 				return;
 			}
-			resolve(socket);
+			settle(() => resolve(socket));
 		});
-		req.on("error", reject);
+		req.on("error", (error) => settle(() => reject(error)));
 		req.end();
 	});
 }
@@ -1209,11 +1385,24 @@ async function startTunnelTls(
 	socket: import("node:net").Socket,
 	host: string,
 	signal?: AbortSignal,
+	timeoutMs: number = META_PROXY_CONNECT_TIMEOUT_MS,
 ): Promise<import("node:tls").TLSSocket> {
 	const { connect } = await import("node:tls");
 	return await new Promise((resolve, reject) => {
-		const secured = connect({ socket, servername: host }, () => resolve(secured));
-		secured.on("error", reject);
+		const timer = setTimeout(() => {
+			secured.destroy();
+			reject(
+				new Error(`pi-meta: TLS to ${host} timed out after ${timeoutMs} ms`),
+			);
+		}, timeoutMs);
+		const secured = connect({ socket, servername: host }, () => {
+			clearTimeout(timer);
+			resolve(secured);
+		});
+		secured.on("error", (error: Error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
 		signal?.addEventListener(
 			"abort",
 			() => {
@@ -2072,6 +2261,13 @@ export function streamMetaSimple(
 					delete message.errorMessage;
 					message.stopReason = "aborted";
 				} else {
+					// Same rule as the event path: a proxy that never answered is a
+					// configuration problem, and naming it keeps pi from retrying a
+					// socket it cannot open. A DNS failure surfaces here as a throw.
+					const proxyFailure = lastMetaProxyFailure();
+					if (proxyFailure) {
+						message.errorMessage = proxyErrorMessage(proxyFailure);
+					}
 					learnFromMetaError(message.errorMessage ?? "", model.id, options?.apiKey);
 				}
 				outer.push({
@@ -2091,6 +2287,17 @@ export function streamMetaSimple(
 			}
 
 			const failure = result.message;
+			// A proxy that never answered folds into pi-ai's generic "Connection
+			// error.", which pi would retry against the agent-level budget. Name
+			// the endpoint instead: the text below is one pi classifies as
+			// terminal, and it is the truth about what failed.
+			const proxyFailure =
+				failure.stopReason === "error" && result.pending.length === 0
+					? lastMetaProxyFailure()
+					: undefined;
+			if (proxyFailure) {
+				failure.errorMessage = proxyErrorMessage(proxyFailure);
+			}
 			const errorText = failure.errorMessage ?? "";
 			learnFromMetaError(errorText, model.id, options?.apiKey);
 
@@ -2258,7 +2465,7 @@ export function startLiveCatalogRefresh(
 			if (models.length === 0) {
 				noteMetaCatalogResult(models);
 				metaStreamState.notify?.(
-					"pi-meta: Meta returned an empty model catalog for this key — the account has no model access. Check /login meta or the key in the Meta developer console.",
+					"pi-meta: Meta returned an empty model catalog for this key — the account has no model access, or this network's exit is blocked by Meta's country restrictions. Check /login meta and the key in the Meta developer console; if the same key works elsewhere, set META_PROXY (see README).",
 					"warning",
 				);
 				return;

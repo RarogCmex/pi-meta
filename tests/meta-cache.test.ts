@@ -15,6 +15,7 @@ import {
 	resetMetaProxyFetch,
 	probeEncryptedReasoningEntitlement,
 	resetCatalogRefreshState,
+	setMetaCatalogIPv4Fetcher,
 	shouldRefreshCatalog,
 	startLiveCatalogRefresh,
 	toProviderModels,
@@ -636,6 +637,50 @@ describe("Meta Responses cache and reasoning contracts", () => {
 			delete process.env["META_PROXY"];
 		}
 		expect(notices.join("\n")).toContain("must be an http:// CONNECT proxy");
+	});
+
+	// A geography-gated exit produces an empty catalog and says nothing about
+	// it, so the startup warning must name that possibility next to the key.
+	test("the empty-catalog warning names the geography gate", async () => {
+		resetCatalogRefreshState();
+		const handlers = new Map<string, unknown>();
+		metaOAuthProvider({
+			registerProvider() {},
+			on(event: string, next: unknown) {
+				handlers.set(event, next);
+			},
+		} as unknown as ExtensionAPI);
+		const sessionStart = handlers.get("session_start") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		const notices: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			jsonResponse({ object: "list", data: [] })) as unknown as typeof fetch;
+		setMetaCatalogIPv4Fetcher(async () => undefined);
+		try {
+			await sessionStart?.(
+				{ type: "session_start", reason: "startup" },
+				{
+					hasUI: true,
+					ui: { notify: (message: string) => notices.push(message) },
+					modelRegistry: {
+						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
+					},
+				},
+			);
+			const deadline = Date.now() + 5_000;
+			while (notices.length === 0 && Date.now() < deadline) {
+				await Bun.sleep(20);
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+			setMetaCatalogIPv4Fetcher(undefined);
+		}
+		const text = notices.join("\n");
+		expect(text).toContain("empty model catalog");
+		expect(text).toContain("country restrictions");
+		expect(text).toContain("META_PROXY");
 	});
 
 	test("requests the live catalog on session start", async () => {

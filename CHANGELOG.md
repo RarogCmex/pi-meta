@@ -49,15 +49,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (~3.4 s per turn, pi startup included). A catalog that lists models again
   lifts the verdict immediately, and with `META_CATALOG_IPV4=0` an empty answer
   still means "no information".
-- `session_start` warns once (`pi-meta: Meta returned an empty model catalog for
-  this key — the account has no model access`) instead of leaving the failure to
-  surface as a bare 404 mid-turn, and warns immediately when `META_PROXY` cannot
-  be parsed (a malformed proxy used to be swallowed by the startup pass).
+- `session_start` warns once about an empty catalog — now naming both causes:
+  no model access **or** a country-blocked exit (`… or this network's exit is
+  blocked by Meta's country restrictions. Check /login meta and the key in the
+  Meta developer console; if the same key works elsewhere, set META_PROXY`) —
+  and warns immediately when `META_PROXY` cannot be parsed (a malformed proxy
+  used to be swallowed by the startup pass).
+- Proxy failures are visible and terminal instead of silent. A dead endpoint
+  warns by name (`pi-meta: proxy <host:port> failed (…) — trying the next
+  endpoint (…)`), an exhausted list raises an error, both deduped per 60 s, and
+  reaching an exit is capped at `META_PROXY_CONNECT_TIMEOUT_MS` (10 s, CONNECT +
+  TLS). The turn ends with `pi-meta: META_PROXY endpoint <host:port> is unusable
+  — <reason>. Check META_PROXY/META_PROXIES (see README); this request never
+  reached Meta.` — wording chosen so pi does **not** retry it: measured, a dead
+  exit against this host's `retry.maxRetries: 10` hung for 90 s because the raw
+  `getaddrinfo ENOTFOUND …` is in pi's retryable set.
 - The live cache probe uses `META_PROXY`/`META_PROXIES` when set and treats a gated
   exit (catalog listed, calls 404) as "nothing to measure" instead of a failure;
   the hermetic suites clear them in `beforeEach` so a proxy in the
   developer shell can never reroute a stubbed test.
-- `bun run typecheck` clean, `bun test` **106 pass / 1 skip / 0 fail** with and
+- `bun run typecheck` clean, `bun test` **112 pass / 1 skip / 0 fail** with and
   without a proxy configured (`tests/meta-proxy.test.ts` covers parsing, the
   `host:port:user:pass` form, CONNECT credentials, fall-through and quarantine).
 

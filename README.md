@@ -95,6 +95,22 @@ flaky exit costs one attempt instead of the turn. A proxy that answers *anything
 (even `404`) is healthy and keeps its place. When every endpoint is cooling, they
 are all tried anyway rather than failing the turn.
 
+Failures are loud and terminal:
+
+- Reaching an exit is capped at 10 s (CONNECT answer + TLS), so a proxy that
+  swallows the connection cannot hang the turn.
+- Every dead endpoint raises a warning naming it (`proxy 1.2.3.4:3128 failed …`),
+  and exhausting the list raises an error with the full list — deduped per
+  60 s window, so a retry loop cannot turn them into a stream.
+- The turn then ends with
+  `pi-meta: META_PROXY endpoint <host:port> is unusable — <reason>. Check
+  META_PROXY/META_PROXIES (see README); this request never reached Meta.`
+  That wording is deliberate: pi retries whatever its classifier calls
+  transient, and the raw `getaddrinfo ENOTFOUND …` is in that set — measured, a
+  dead exit against `retry.maxRetries: 10` hung for 90 s before this.
+- An empty catalog warning says so too: no model access **or** a country-blocked
+  exit (`… or this network's exit is blocked by Meta's country restrictions …`).
+
 Use this instead of `HTTPS_PROXY` (or the `httpProxy` setting) when only Meta
 needs the detour: pi's proxy is one process-wide dispatcher, so it reroutes
 every provider — measured: NVIDIA answers `403` through the same exit.
