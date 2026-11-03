@@ -10,6 +10,7 @@ import {
 	fetchMetaCatalog,
 	isChatCatalogId,
 	isKnownMetaModelId,
+	liveCatalogEmptyConfirmed,
 	loginMeta,
 	META_API_BASE_URL,
 	META_MODEL_CATALOG_URL,
@@ -19,6 +20,7 @@ import {
 	refreshMetaModels,
 	refreshMetaToken,
 	resetCatalogRefreshState,
+	resetMetaProxyFetch,
 	setMetaCatalogIPv4Fetcher,
 	STATIC_API_KEY_PREFIX,
 	toProviderModels,
@@ -72,6 +74,9 @@ describe("Meta OAuth provider", () => {
 	// phase republishes ids this process actually fetched. Reset it between
 	// tests so store-restore assertions see only their own fixture.
 	beforeEach(() => {
+		// Hermetic: a proxy in the developer shell must not reroute a stubbed test.
+		delete process.env["META_PROXY_URL"];
+		resetMetaProxyFetch();
 		resetCatalogRefreshState();
 	});
 
@@ -1110,8 +1115,7 @@ describe("Meta catalog IPv4 fallback", () => {
 		expect(ipv4Calls).toBe(0);
 	});
 
-	test("META_CATALOG_IPV4=0 disables the retry", async () => {
-		let ipv4Calls = 0;
+	test("META_CATALOG_IPV4=0 disables the retry", async () => {		let ipv4Calls = 0;
 		process.env["META_CATALOG_IPV4"] = "0";
 		stubPrimary(async () => jsonResponse({ object: "list", data: [] }));
 		setMetaCatalogIPv4Fetcher(async () => {
@@ -1135,5 +1139,40 @@ describe("Meta catalog IPv4 fallback", () => {
 		setMetaCatalogIPv4Fetcher(async () => undefined);
 
 		await expect(fetchMetaCatalog("model-api-key")).rejects.toThrow("boom");
+	});
+
+	// Measured 2026-11-03: an account can lose every model entitlement. `GET
+	// /v1/models` then answers 200 with an empty list and every chat request
+	// returns 404 `model_not_found` — on IPv4, on IPv6, and behind a US
+	// residential proxy. That is a verdict, not the gateway flake the retry
+	// layer exists for, so the first attempt must be the last one.
+	test("treats a confirmed-empty catalog as a verdict, not a flake", async () => {
+		stubPrimary(async () => jsonResponse({ object: "list", data: [] }));
+		setMetaCatalogIPv4Fetcher(async () => undefined);
+		const context = {
+			credential: { type: "api_key", key: "unentitled-key" },
+			store: {
+				read: async () => undefined,
+				write: async () => {},
+				delete: async () => {},
+			},
+			allowNetwork: true,
+			signal: new AbortController().signal,
+		} as unknown as RefreshModelsContext;
+
+		const models = await refreshMetaModels(context);
+
+		// The picker keeps working off pi's rows and the bundled pins.
+		expect(models.length).toBeGreaterThan(0);
+		expect(models.map((model) => model.id)).toEqual(FALLBACK_CATALOG_IDS);
+		expect(liveCatalogEmptyConfirmed()).toBe(true);
+		expect(isKnownMetaModelId("muse-spark-1.3")).toBe(false);
+
+		// A catalog that lists models again lifts the verdict immediately.
+		stubPrimary(async () => jsonResponse({ object: "list", data: [{ id: "muse-spark-1.3" }] }));
+		await refreshMetaModels(context);
+
+		expect(liveCatalogEmptyConfirmed()).toBe(false);
+		expect(isKnownMetaModelId("muse-spark-1.3")).toBe(true);
 	});
 });

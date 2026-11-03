@@ -854,6 +854,213 @@ export function setMetaCatalogIPv4Fetcher(
 }
 
 /**
+ * Optional provider-scoped proxy for Meta's API.
+ *
+ * Measured 2026-11-03 from a Georgian residential line with two working keys:
+ * `GET /v1/models` answers `200 {"data":[]}` and every chat id answers `404
+ * model_not_found`, while the same key behind a US residential exit lists nine
+ * ids and completes turns. Meta gates the Model API by exit geography, so the
+ * failure looks exactly like a dead key.
+ *
+ * Pi's own proxy support is a single process-wide `EnvHttpProxyAgent` (settings
+ * `httpProxy`, or `HTTP(S)_PROXY`), which routes *every* provider through it —
+ * measured: NVIDIA answers `403` through the same exit. `META_PROXY_URL` keeps
+ * the detour local to this provider: a fetch that opens an HTTP `CONNECT`
+ * tunnel to the proxy and speaks HTTP/1.1 to `api.meta.ai` over it.
+ */
+export function metaProxyUrl(
+	env: Record<string, string | undefined> = process.env,
+): string | undefined {
+	const raw = env["META_PROXY_URL"]?.trim();
+	return raw ? raw : undefined;
+}
+
+let cachedProxyFetch: { url: string; fetch: Fetch } | undefined;
+
+/** The fetch for `META_PROXY_URL`, cached per URL; `undefined` when unset. */
+export function metaProxyFetch(
+	env: Record<string, string | undefined> = process.env,
+): Fetch | undefined {
+	const url = metaProxyUrl(env);
+	if (!url) return undefined;
+	if (cachedProxyFetch?.url === url) return cachedProxyFetch.fetch;
+	const created = createMetaProxyFetch(url);
+	cachedProxyFetch = { url, fetch: created };
+	return created;
+}
+
+/** Test seam: forget the cached proxy transport. */
+export function resetMetaProxyFetch(): void {
+	cachedProxyFetch = undefined;
+}
+
+/**
+ * Builds a `fetch` that reaches `https://` targets through an HTTP `CONNECT`
+ * proxy. Only the shapes pi-ai sends are supported (JSON string or byte body),
+ * and response streams are handed back unbuffered so SSE reaches pi live.
+ */
+export function createMetaProxyFetch(proxyUrl: string): Fetch {
+	const proxy = new URL(proxyUrl);
+	if (proxy.protocol !== "http:") {
+		throw new Error(
+			`pi-meta: META_PROXY_URL must be an http:// CONNECT proxy, got ${proxy.protocol}`,
+		);
+	}
+	const proxyHost = proxy.hostname;
+	const proxyPort = Number(proxy.port || 80);
+	const proxyAuth = proxy.username
+		? `Basic ${Buffer.from(
+				`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
+				"utf8",
+			).toString("base64")}`
+		: undefined;
+
+	const proxied = async (
+		input: Parameters<Fetch>[0],
+		init?: Parameters<Fetch>[1],
+	): Promise<Response> => {
+		const target = new URL(
+			typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.href
+					: input.url,
+		);
+		if (target.protocol !== "https:") {
+			throw new Error(
+				`pi-meta: the proxy transport only tunnels https targets, got ${target.protocol}`,
+			);
+		}
+		const headers = new Headers(init?.headers);
+		const body = init?.body;
+		let payload: Uint8Array | undefined;
+		if (typeof body === "string") payload = Buffer.from(body, "utf8");
+		else if (body instanceof Uint8Array) payload = body;
+		else if (body !== undefined && body !== null)
+			throw new Error(
+				"pi-meta: the proxy transport supports string and byte request bodies only",
+			);
+		if (payload && !headers.has("content-length"))
+			headers.set("content-length", String(payload.byteLength));
+
+		const targetPort = Number(target.port || 443);
+		const signal = init?.signal ?? undefined;
+		const tunnel = await openProxyTunnel({
+			proxyHost,
+			proxyPort,
+			proxyAuth,
+			targetHost: target.hostname,
+			targetPort,
+			signal,
+		});
+		const secured = await startTunnelTls(tunnel, target.hostname, signal);
+		const { request } = await import("node:http");
+		const { Readable } = await import("node:stream");
+
+		return await new Promise<Response>((resolve, reject) => {
+			const req = request(
+				{
+					method: (init?.method ?? "GET").toUpperCase(),
+					path: `${target.pathname}${target.search}`,
+					headers: { ...Object.fromEntries(headers), host: target.hostname },
+					// The TLS layer is already open, so plain HTTP/1.1 rides on top of it.
+					createConnection: () => secured,
+					...(signal ? { signal } : {}),
+				},
+				(res) => {
+					const responseHeaders = new Headers();
+					for (const [name, value] of Object.entries(res.headers)) {
+						if (value === undefined) continue;
+						if (Array.isArray(value)) for (const entry of value) responseHeaders.append(name, entry);
+						else responseHeaders.set(name, value);
+					}
+				resolve(
+					new Response(
+						Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>,
+						{
+							status: res.statusCode ?? 502,
+							statusText: res.statusMessage ?? "",
+							headers: responseHeaders,
+						},
+					),
+				);
+				},
+			);
+			req.on("error", reject);
+			req.end(payload ? Buffer.from(payload) : undefined);
+		});
+	};
+
+	// Bun's `fetch` type carries `preconnect`; the tunnel has no connection pool.
+	return proxied as Fetch;
+}
+
+interface ProxyTunnelRequest {
+	proxyHost: string;
+	proxyPort: number;
+	proxyAuth?: string;
+	targetHost: string;
+	targetPort: number;
+	signal?: AbortSignal;
+}
+
+async function openProxyTunnel(
+	options: ProxyTunnelRequest,
+): Promise<import("node:net").Socket> {
+	const { request } = await import("node:http");
+	const authority = `${options.targetHost}:${options.targetPort}`;
+	return await new Promise((resolve, reject) => {
+		const req = request({
+			host: options.proxyHost,
+			port: options.proxyPort,
+			method: "CONNECT",
+			path: authority,
+			headers: {
+				host: authority,
+				...(options.proxyAuth
+					? { "proxy-authorization": options.proxyAuth }
+					: {}),
+			},
+			...(options.signal ? { signal: options.signal } : {}),
+		});
+		req.on("connect", (res, socket) => {
+			if (res.statusCode !== 200) {
+				socket.destroy();
+				reject(
+					new Error(
+						`pi-meta: proxy CONNECT refused with HTTP ${res.statusCode ?? 0}`,
+					),
+				);
+				return;
+			}
+			resolve(socket);
+		});
+		req.on("error", reject);
+		req.end();
+	});
+}
+
+async function startTunnelTls(
+	socket: import("node:net").Socket,
+	host: string,
+	signal?: AbortSignal,
+): Promise<import("node:tls").TLSSocket> {
+	const { connect } = await import("node:tls");
+	return await new Promise((resolve, reject) => {
+		const secured = connect({ socket, servername: host }, () => resolve(secured));
+		secured.on("error", reject);
+		signal?.addEventListener(
+			"abort",
+			() => {
+				secured.destroy();
+				reject(new Error("pi-meta: proxy request aborted"));
+			},
+			{ once: true },
+		);
+	});
+}
+
+/**
  * GET over a forced IPv4 socket. `node:https` is built into Node and Bun, so
  * this adds no dependency and no global dispatcher: undici's `fetch` cannot be
  * told which address family to use without one.
@@ -976,7 +1183,33 @@ export async function fetchMetaCatalog(
 const liveCatalog: {
 	models?: MetaProviderModel[];
 	fetchedAt?: number;
+	emptyConfirmedAt?: number;
 } = {};
+
+/**
+ * Records what a catalog fetch learned.
+ *
+ * A non-empty answer refreshes the live catalog. An empty one is usually Meta's
+ * IPv6 edge answering 200 with no rows while IPv4 lists everything, which is why
+ * `fetchMetaCatalog()` retries over IPv4 — so an empty answer only counts as
+ * "this key has no models" once that retry actually ran and still found
+ * nothing. Measured 2026-11-03: a working account can also legitimately end up
+ * with an empty catalog (every model id answers 404 `model_not_found` on both
+ * families and behind a US residential proxy), and that state must stop the
+ * flaky-404 retry instead of costing ~10s per turn.
+ */
+function noteMetaCatalogResult(
+	models: MetaProviderModel[],
+	now: number = Date.now(),
+): void {
+	if (models.length > 0) {
+		liveCatalog.models = models;
+		liveCatalog.fetchedAt = now;
+		delete liveCatalog.emptyConfirmedAt;
+		return;
+	}
+	if (metaCatalogIPv4Enabled()) liveCatalog.emptyConfirmedAt = now;
+}
 
 export async function refreshMetaModels(
 	context: RefreshModelsContext,
@@ -1000,14 +1233,12 @@ export async function refreshMetaModels(
 	if (!apiKey) return composeMetaModels(base);
 
 	try {
-		const models = await fetchMetaCatalog(apiKey, fetchImpl, context.signal);
-		// An empty answer means "no information" (Meta's IPv6 edge answers 200
-		// with an empty list), never "this key has no models": keep whatever the
-		// previous pass knew.
-		if (models.length > 0 && !context.signal?.aborted) {
-			liveCatalog.models = models;
-			liveCatalog.fetchedAt = Date.now();
-		}
+		const transport =
+			fetchImpl === fetch ? (metaProxyFetch() ?? fetch) : fetchImpl;
+		const models = await fetchMetaCatalog(apiKey, transport, context.signal);
+		// A previous non-empty catalog is kept when this pass learns nothing, so
+		// the picker does not empty out on a transient failure.
+		if (!context.signal?.aborted) noteMetaCatalogResult(models);
 	} catch (error) {
 		if (context.signal?.aborted) throw error;
 		// A failed fetch leaves the previous live catalog, pi's rows and the
@@ -1334,9 +1565,18 @@ export function isKnownMetaModelId(
 ): boolean {
 	if (!modelId) return false;
 	if (notFoundRecently(apiKey, modelId)) return false;
+	// A confirmed-empty catalog is authoritative: the key reaches no model at
+	// all, so no id is "known" and a 404 is a verdict rather than a flake.
+	if (liveCatalogEmptyConfirmed()) return false;
 	const live = liveCatalog.models;
 	if (live && live.length > 0) return live.some((model) => model.id === modelId);
 	return FALLBACK_MODELS.some((model) => model.id === modelId);
+}
+
+/** True while the process holds a freshly confirmed empty Meta catalog. */
+export function liveCatalogEmptyConfirmed(now: number = Date.now()): boolean {
+	const at = liveCatalog.emptyConfirmedAt;
+	return at !== undefined && now - at < NOT_FOUND_BACKOFF_MS;
 }
 
 /**
@@ -1410,7 +1650,6 @@ export function bindMetaStreamState(hooks: {
 	metaStreamState.notify = hooks.notify;
 	metaStreamState.refreshCatalog = hooks.refreshCatalog;
 }
-
 /** Test seam: drop session bindings and the exhaustion-notification dedupe. */
 export function resetMetaStreamState(): void {
 	bindMetaStreamState({});
@@ -1637,6 +1876,12 @@ export function streamMetaSimple(
 	const config = deps.config ?? DEFAULT_META_RETRY;
 	const enabled = deps.enabled ?? metaTransportRetryEnabled(deps.env);
 	const sleep = deps.sleep ?? interruptibleRetrySleep;
+	// `META_PROXY_URL` keeps the detour provider-scoped: pi's own proxy is a
+	// process-wide dispatcher that also reroutes every other provider.
+	const proxied = metaProxyFetch(deps.env);
+	const requestOptions: MetaStreamOptions = proxied
+		? { ...options, fetch: proxied }
+		: options;
 
 	const deliverFailure = (
 		failure: MetaAttemptFailure,
@@ -1652,7 +1897,7 @@ export function streamMetaSimple(
 		for (let attempt = 1; ; attempt++) {
 			let result: MetaAttempt;
 			try {
-				result = await runMetaAttempt(outer, inner, model, context, options);
+				result = await runMetaAttempt(outer, inner, model, context, requestOptions);
 			} catch (error) {
 				// The inner API must fold its own throws into error events; keep the
 				// stream contract anyway instead of leaving pi waiting forever.
@@ -1831,10 +2076,21 @@ export function startLiveCatalogRefresh(
 				META_PROVIDER_ID,
 			))?.auth?.apiKey;
 			if (!apiKey || signal.aborted) return;
-			const models = await fetchMetaCatalog(apiKey, fetch, signal);
-			if (models.length === 0 || signal.aborted) return;
-			liveCatalog.models = models;
-			liveCatalog.fetchedAt = Date.now();
+			const models = await fetchMetaCatalog(
+				apiKey,
+				metaProxyFetch() ?? fetch,
+				signal,
+			);
+			if (signal.aborted) return;
+			if (models.length === 0) {
+				noteMetaCatalogResult(models);
+				metaStreamState.notify?.(
+					"pi-meta: Meta returned an empty model catalog for this key — the account has no model access. Check /login meta or the key in the Meta developer console.",
+					"warning",
+				);
+				return;
+			}
+			noteMetaCatalogResult(models);
 			// Re-registration takes effect immediately after binding, and the
 			// offline refresh it kicks recomposes from the same live catalog plus
 			// pi's own rows. `registerProvider()` merges by key, so `models` must be
@@ -1865,6 +2121,7 @@ export function resetCatalogRefreshState(): void {
 	delete catalogRefreshState.inFlight;
 	delete liveCatalog.models;
 	delete liveCatalog.fetchedAt;
+	delete liveCatalog.emptyConfirmedAt;
 	// The fail-fast marks are process state too; tests must not inherit them.
 	notFoundCache.clear();
 }

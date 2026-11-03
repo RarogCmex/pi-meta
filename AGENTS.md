@@ -56,6 +56,25 @@ Two catalog rules measured 2026-10-11 with a live Muse Model API key:
   `setMetaCatalogIPv4Fetcher()` is the hermetic test seam, and the retry only
   arms for the fetch identity this module saw at load time so stubbed tests
   never reach the network.
+- **An empty catalog can also be the truth.** Measured 2026-11-03 with two keys
+  of the same account (an older `LLM|…` and a fresh `LLM_…`): `GET /v1/models`
+  answered `200 {"data":[]}` and every id (`muse-spark-1.1/1.2/1.3`, both
+  contributor SKUs, `muse-wonder-1.0`, `sam-3.1`, `muse-image-1.0`,
+  `muse-voice-transcribe-1.0`) returned `404 model_not_found` on
+  `/v1/responses` *and* `/v1/chat/completions`. Two causes produce exactly that
+  answer, and neither is provable from the body: a key whose team has a billing
+  issue (through a working exit it answers `402 billing_not_configured` instead)
+  and an exit Meta gates by geography. The protocol is never the variable —
+  `/v1/chat/completions` answers the same 404 — so do not go looking for a
+  Responses-API problem. `noteMetaCatalogResult()` therefore records an empty
+  answer as authoritative (fresh for `NOT_FOUND_BACKOFF_MS`) once the IPv4
+  fallback ran and found nothing either; `isKnownMetaModelId()` then returns
+  `false`, so the flaky-404 retry budget is not spent on a verdict and the first
+  attempt is the last. `META_CATALOG_IPV4=0` keeps the old "empty means no
+  information" reading, an answer that lists models lifts the verdict
+  immediately, and `session_start` warns once instead of letting a mid-turn 404
+  carry the news. The picker is unaffected: composition keeps falling back to
+  pi's rows and the bundled pins.
 
 Pins must stay in step with pi's own generated catalog, because this
 extension's `models` array *replaces* pi's list for provider `meta`
@@ -173,6 +192,34 @@ live cache probe without any env. Checks that were run on 2026-10-11:
 - `api.meta.ai` flaps between healthy and hard windows on a minute timescale
   (raw curl: 12/12 ok, then 16/16 404, then 3/6 404, then 6/6 404). Always
   re-measure with a raw curl before blaming the extension for a 404.
+
+## Geography gate and META_PROXY_URL
+
+Meta gates the Model API by exit geography, and the gate is silent. Measured
+2026-11-03 from a Georgian residential line with a key that works elsewhere:
+`/v1/responses` with `muse-spark-1.3` answered **8/8 `404 model_not_found`
+direct** and **8/8 `200` through a US residential exit**; `GET /v1/models`
+answers `200 {"data":[]}` on the gated exit. The key stays valid — no key at all
+is `401 invalid_api_key`, a gated key is a 404 that looks like a typo.
+
+`META_PROXY_URL` (an `http://` CONNECT proxy) is the provider-scoped way out:
+`createMetaProxyFetch()` opens the tunnel, speaks HTTP/1.1 over it, streams the
+response unbuffered (SSE reaches pi live) and is applied to `streamSimple` and to
+the catalog fetch. Do **not** reach for `HTTPS_PROXY` / the `httpProxy` setting
+first: pi installs one process-wide `EnvHttpProxyAgent`, so every provider takes
+the detour — measured: NVIDIA answers `403` through the same exit.
+
+Verified end to end with the operator's keys and a Verizon residential exit:
+`META_PROXY_URL=… pi -p -ne -e ./extensions/meta.ts --model meta/muse-spark-1.3`
+→ `pong` in 3–4 s, a tool-calling turn through `muse-wonder-1.0`, and `bun test`
+97 pass / 1 skip / 0 fail with the env set (the hermetic suites clear
+`META_PROXY_URL` in `beforeEach`; the live probe uses it when present).
+
+Key hygiene learned in the same session: keys minted for a team with an
+unsettled bill answer `402 billing_not_configured` (they look healthy until a
+chat request), and a revoked key answers `401` on every surface including the
+catalog. Check a key with `/v1/models` **and** one `muse-spark-1.3` call through
+the exit you will actually use.
 
 ## Transparent error handling
 

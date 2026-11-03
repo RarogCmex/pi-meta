@@ -26,6 +26,7 @@ import {
 	metaTransportRetryEnabled,
 	refreshMetaModels,
 	resetCatalogRefreshState,
+	resetMetaProxyFetch,
 	resetMetaStreamState,
 	streamMetaSimple,
 	type MetaInnerApi,
@@ -344,6 +345,8 @@ describe("Meta transient-error classification", () => {
 
 describe("Meta transparent retry stream", () => {
 	beforeEach(() => {
+		delete process.env["META_PROXY_URL"];
+		resetMetaProxyFetch();
 		resetMetaStreamState();
 	});
 

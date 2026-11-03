@@ -65,6 +65,31 @@ passes the key through unchanged instead of trying to re-mint it:
 Environment keys also work without any login: set `META_API_KEY` (or
 `MODEL_API_KEY`, which the extension shims onto `META_API_KEY`).
 
+## When the API is unreachable from your network
+
+Meta gates the Model API by exit geography, and the gate is invisible: the key
+authenticates (`401` only without a key), `GET /v1/models` answers `200` with an
+empty `data: []`, and every chat id answers `404 model_not_found`. Measured
+2026-11-03 from a Georgian residential line with a key that works: **8/8 calls
+404 direct, 8/8 calls 200 behind a US residential exit**. Nothing in the error
+says "wrong country", so it reads exactly like a dead key.
+
+Set `META_PROXY_URL` to an HTTP `CONNECT` proxy and the extension tunnels
+*only* Meta's traffic through it:
+
+```bash
+META_PROXY_URL=http://user:pass@host:3128 pi
+```
+
+Use this instead of `HTTPS_PROXY` (or the `httpProxy` setting) when only Meta
+needs the detour: pi's proxy is one process-wide dispatcher, so it reroutes
+every provider — measured: NVIDIA answers `403` through the same exit.
+
+The transport speaks HTTP/1.1 over the tunnel, streams responses unbuffered, and
+covers the catalog fetch too. When the catalog is confirmed empty, the provider
+fails a turn in one attempt instead of retrying the 404 eight times, and
+`session_start` warns once instead of leaving the news to a bare mid-turn error.
+
 ## Prompt caching and encrypted reasoning
 
 Muse Spark on `api.meta.ai` returns no useful cache hits on

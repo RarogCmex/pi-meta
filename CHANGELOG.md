@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] - 2026-11-03
+
+### Added
+
+- **`META_PROXY_URL`** — a provider-scoped HTTP `CONNECT` tunnel. Meta gates the
+  Model API by exit geography and the gate is silent: measured 2026-11-03 with a
+  key that works, `/v1/responses` answered **8/8 `404 model_not_found` direct**
+  and **8/8 `200` through a US residential exit**, while `GET /v1/models`
+  answered `200 {"data":[]}` on the gated exit. `createMetaProxyFetch()` opens
+  the tunnel, speaks HTTP/1.1 over it, streams responses unbuffered, and is
+  applied to both `streamSimple` and the catalog fetch. No dependency, no global
+  dispatcher: `HTTPS_PROXY`/`httpProxy` stay untouched because pi's proxy is
+  process-wide and reroutes every provider (measured: NVIDIA answers `403`
+  through the same exit).
+
+### Fixed
+
+- A catalog that is *confirmed* empty now ends the retry conversation instead of
+  feeding it. Measured 2026-11-03 with two keys of the same account (the older
+  `LLM|…` shape and a fresh `LLM_…` one): `GET /v1/models` answers `200
+  {"data":[]}` and every id — `muse-spark-1.1/1.2/1.3`, both contributor SKUs,
+  `muse-wonder-1.0`, `sam-3.1`, `muse-image-1.0` — returns `404 model_not_found`
+  on `/v1/responses` **and** `/v1/chat/completions`. Two causes look identical
+  from the body: a team with a billing issue (through a working exit the same
+  keys answer `402 billing_not_configured`) and a geography-gated exit. Either
+  way the extension used to spend ~10 s on 8 attempts before saying "model not
+  found".
+  `noteMetaCatalogResult()` now records an empty answer as authoritative once the
+  IPv4 fallback actually ran and found nothing either; `isKnownMetaModelId()`
+  returns `false` while that verdict is fresh, so the first attempt is the last
+  (~3.4 s per turn, pi startup included). A catalog that lists models again
+  lifts the verdict immediately, and with `META_CATALOG_IPV4=0` an empty answer
+  still means "no information".
+- `session_start` warns once (`pi-meta: Meta returned an empty model catalog for
+  this key — the account has no model access`) instead of leaving the failure to
+  surface as a bare 404 mid-turn.
+- The live cache probe uses `META_PROXY_URL` when it is set and treats a gated
+  exit (catalog listed, calls 404) as "nothing to measure" instead of a failure;
+  the hermetic suites clear `META_PROXY_URL` in `beforeEach` so a proxy in the
+  developer shell can never reroute a stubbed test.
+- `bun run typecheck` clean, `bun test` **97 pass / 1 skip / 0 fail** with and
+  without `META_PROXY_URL`.
+
 ## [0.10.2] - 2026-11-03
 
 ### Fixed
