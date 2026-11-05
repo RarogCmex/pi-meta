@@ -323,6 +323,14 @@ asserted in `tests/meta-proxy.test.ts`):
    handshake with an HTTP error"; the exact code stays in the warning
    (`notifyProxyDown`), which pi never classifies.
 
+Runtime floor for the tunnel: **Bun ≥ 1.4, or Node** (what pi itself runs on).
+Bun 1.3.x wires `node:http` to `fetch`, which cannot carry an authority-form
+`CONNECT` (`fetch() URL is invalid`) nor honour `createConnection` for the
+request over the tunnel (`ECONNREFUSED`). `openProxyTunnel()` no longer depends
+on that shim — it writes the CONNECT line on a raw `node:net` socket — but
+`sendOverTunnel()` still uses `node:http`, so CI pins `bun-version: 1.4.2` and
+the suite is only asserted there and on Node.
+
 ## Transparent error handling
 
 `api.meta.ai` answers a flooded or slow request with HTTP 5xx — most often 504

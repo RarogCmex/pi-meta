@@ -1347,54 +1347,106 @@ interface ProxyTunnelRequest {
 	timeoutMs?: number;
 }
 
+/**
+ * Opens the `CONNECT` tunnel over a raw `node:net` socket.
+ *
+ * Deliberately not `http.request({ method: "CONNECT", path: authority })`:
+ * Bun 1.3.x implements `node:http` on top of `fetch`, and an authority-form path
+ * makes it build an invalid URL — every tunnel died with `fetch() URL is
+ * invalid` (measured on 1.3.14, green on 1.4.2). A raw socket plus a hand-written
+ * request line is the same bytes on every runtime and removes a layer.
+ */
 async function openProxyTunnel(
 	options: ProxyTunnelRequest,
 ): Promise<import("node:net").Socket> {
-	const { request } = await import("node:http");
+	const { connect } = await import("node:net");
 	const authority = `${options.targetHost}:${options.targetPort}`;
 	const timeoutMs = options.timeoutMs ?? META_PROXY_CONNECT_TIMEOUT_MS;
 	return await new Promise((resolve, reject) => {
-		const req = request({
+		const socket = connect({
 			host: options.proxyHost,
 			port: options.proxyPort,
-			method: "CONNECT",
-			path: authority,
-			headers: {
-				host: authority,
-				...(options.proxyAuth
-					? { "proxy-authorization": options.proxyAuth }
-					: {}),
-			},
-			...(options.signal ? { signal: options.signal } : {}),
 		});
+		socket.setNoDelay(true);
+		let buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+		let settled = false;
+
+		const settle = (fn: () => void): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			socket.off("data", onData);
+			socket.off("error", onError);
+			socket.off("close", onClose);
+			options.signal?.removeEventListener("abort", onAbort);
+			fn();
+		};
+
 		const timer = setTimeout(() => {
-			req.destroy();
-			reject(
-				new Error(
-					`pi-meta: proxy CONNECT to ${authority} timed out after ${timeoutMs} ms`,
+			socket.destroy();
+			settle(() =>
+				reject(
+					new Error(
+						`pi-meta: proxy CONNECT to ${authority} timed out after ${timeoutMs} ms`,
+					),
 				),
 			);
 		}, timeoutMs);
-		const settle = (fn: () => void): void => {
-			clearTimeout(timer);
-			fn();
+
+		const onAbort = (): void => {
+			socket.destroy();
+			settle(() => reject(new Error("pi-meta: proxy request aborted")));
 		};
-		req.on("connect", (res, socket) => {
-			if (res.statusCode !== 200) {
-				socket.destroy();
-				settle(() =>
-					reject(
-						new Error(
-							`pi-meta: proxy CONNECT refused with HTTP ${res.statusCode ?? 0}`,
-						),
-					),
-				);
+		const onError = (error: Error): void => settle(() => reject(error));
+		const onClose = (): void =>
+			settle(() =>
+				reject(
+					new Error("pi-meta: the proxy hung up before answering CONNECT"),
+				),
+			);
+
+		const onData = (chunk: Buffer): void => {
+			buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
+			const end = buffered.indexOf("\r\n\r\n");
+			if (end === -1) {
+				if (buffered.length > 16 * 1024) {
+					socket.destroy();
+					settle(() =>
+						reject(new Error("pi-meta: proxy CONNECT answer is too large")),
+					);
+				}
 				return;
 			}
-			settle(() => resolve(socket));
-		});
-		req.on("error", (error) => settle(() => reject(error)));
-		req.end();
+			const head = buffered.subarray(0, end).toString("latin1");
+			const status = Number(/^HTTP\/1\.[01] (\d{3})/i.exec(head)?.[1] ?? 0);
+			// Anything past the header block arrived already tunneled; hand it to
+			// the next reader instead of dropping it.
+			const rest = buffered.subarray(end + 4);
+			if (rest.length > 0) socket.unshift(rest);
+			if (status === 200) {
+				settle(() => resolve(socket));
+				return;
+			}
+			socket.destroy();
+			settle(() =>
+				reject(
+					new Error(`pi-meta: proxy CONNECT refused with HTTP ${status}`),
+				),
+			);
+		};
+
+		socket.on("error", onError);
+		socket.on("close", onClose);
+		socket.on("data", onData);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		socket.write(
+			`CONNECT ${authority} HTTP/1.1\r\n` +
+				`Host: ${authority}\r\n` +
+				(options.proxyAuth
+					? `Proxy-Authorization: ${options.proxyAuth}\r\n`
+					: "") +
+				"Proxy-Connection: Keep-Alive\r\n\r\n",
+		);
 	});
 }
 

@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The tunnel no longer rides on `node:http`.** Bun 1.3.x implements
+  `node:http` over `fetch`, so the authority-form `path` of a `CONNECT` request
+  made it build an invalid URL — every tunnel died with `fetch() URL is invalid`
+  (measured on Bun 1.3.14; green on 1.4.2, which is what CI pins now).
+  `openProxyTunnel()` speaks the request line on a raw `node:net` socket and
+  parses the status itself, so the bytes are identical on every runtime; the
+  request *over* the tunnel still uses `node:http` and therefore needs Bun ≥ 1.4
+  (Node, which pi itself runs on, is unaffected).
 - **A `socket hang up` from Meta is no longer charged to the proxy.** The tunnel
   and the request over it were one `try`, so a target that dropped the
   connection after `CONNECT` quarantined a healthy exit, told the user the proxy
