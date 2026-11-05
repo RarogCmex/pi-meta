@@ -282,6 +282,23 @@ Exit order is configuration, not code: if Meta ever starts refusing datacenter
 IPs, swap the two entries in `META_PROXIES` — measured with
 `META_PROXIES=<dead>:1,<live>` → `pong`.
 
+**The gate is a blocklist, not a US allowlist.** Swept the HTTP entries of
+`~/.pi/agent/nvidia-proxies.json` on the same day — 8 of 10 complete a
+`muse-spark-1.3` turn (`200`) and 5/5 catalog calls each, from **US, AU and IT**
+exits: `204.252.82.140:46709` (US, 0.7 s), `91.132.58.132:9988` (AU, 0.5 s),
+`91.245.189.176:29842` (IT), `64.205.47.232:3120`, `52.128.4.126:29842`,
+`23.227.76.122:29842`, `194.50.189.21:29842`. Dead: `p.webshare.io` rotate
+(catalog 200, chat hangs) and `gate.nodemaven.com:8080` (no answer at all). The
+SOCKS5 entries in that file are unusable here by design — the transport refuses
+SOCKS by name. The paragraph above still says "US residential exit" because
+that was the first working one measured, not because only the US works:
+Georgia and Germany fail, and that is the whole rule visible so far.
+
+`~/.global-profile` therefore carries a three-deep chain — the US datacenter exit
+plus `204.252.82.140:46709` and `91.132.58.132:9988` — and the rest of the same
+pool is noted next to it as the next refill, since each dead hop costs one
+CONNECT timeout.
+
 Three rules learned from the `socket hang up` reports (fixed 2026-11-04, all
 asserted in `tests/meta-proxy.test.ts`):
 
