@@ -243,11 +243,17 @@ To scope Pi's model picker to Meta models:
 
 Pi runs every in-session model refresh with `allowNetwork: false`, and the only
 networked caller (`pi update --models`) does not load extensions. So this
-extension fetches `GET /v1/models` itself on `session_start` (cooldown: 4h per
-process, skipped under `PI_OFFLINE`) and re-registers the provider so the picker
+extension fetches `GET /v1/models` itself when a Meta model is in use —
+`session_start` if the session already sits on one, `model_select` the moment you
+switch to one (cooldown: 4h per process, skipped under `PI_OFFLINE`) — and
+re-registers the provider so the picker
 and pi's model snapshot pick the ids up. The fetched catalog is kept in memory
 and recomposed on every later refresh, including offline ones, so it is also
 what Pi uses when it starts without network access.
+
+The fetch is deliberately lazy: it is the one place this extension opens a
+`META_PROXY` tunnel outside a turn, so a session on any other provider never
+connects to the exit at all.
 
 The composed list is a merge, not a takeover:
 

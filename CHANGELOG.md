@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-11-04
+
+### Changed
+
+- **The catalog refresh is lazy and provider-gated.** It was the only place this
+  extension opened a `META_PROXY` tunnel before a turn, and it ran on every
+  `session_start` — a Claude/GPT/DeepSeek session paid a proxy CONNECT (and, on
+  a slow exit, up to the 20 s catalog timeout in the background) for a provider
+  it never used. `startLiveCatalogRefresh()` now runs from `session_start` only
+  when the session's model already belongs to `meta` (`isMetaModelActive()`), and
+  from `model_select` when the user switches to one; the existing 4 h cooldown
+  folds the pair into a single fetch. Measured with a logging `CONNECT` sink set
+  as `META_PROXY`: a `deepseek/*` session opens zero tunnels, a
+  `meta/muse-spark-1.3` session opens them as before.
+
 ## [0.10.3] - 2026-11-03
 
 ### Added

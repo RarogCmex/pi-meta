@@ -2417,6 +2417,11 @@ export function createMetaProviderConfig(): MetaProviderConfig {
  * model snapshot update without waiting for a refresh nobody triggers.
  * Fire-and-forget and cooldown-guarded: startup never blocks on Meta, and a
  * failed fetch leaves pi's own rows and the bundled pins in place.
+ *
+ * It is also *lazy*: the fetch walks through `META_PROXY`, so it only runs once
+ * a Meta model is in use — `session_start` calls it when the restored model is
+ * Meta's, `model_select` when the user switches to one. A session on another
+ * provider never opens a tunnel to the exit.
  */
 const catalogRefreshState: {
 	lastAttemptAt?: number;
@@ -2495,6 +2500,19 @@ export function startLiveCatalogRefresh(
 	return tracked;
 }
 
+/**
+ * True when a model belongs to this provider.
+ *
+ * The catalog refresh is a network round trip *through the configured proxy*,
+ * so it is deferred until a Meta model is actually in use: a session on any
+ * other provider never opens a `META_PROXY` tunnel. See `metaOAuthProvider()`.
+ */
+export function isMetaModelActive(
+	model: { provider?: string } | undefined,
+): boolean {
+	return model?.provider === META_PROVIDER_ID;
+}
+
 /** Test seam: drop the cooldown and live catalog so each pass starts clean. */
 export function resetCatalogRefreshState(): void {
 	delete catalogRefreshState.lastAttemptAt;
@@ -2533,10 +2551,24 @@ export default function metaOAuthProvider(pi: ExtensionAPI): void {
 			},
 		});
 		// Discover the ids this key can actually reach; see startLiveCatalogRefresh.
+		// Only a session already sitting on a Meta model pays for it: the fetch
+		// walks through `META_PROXY`, and a session on any other provider must not
+		// touch the exit. Selecting Meta later fires `model_select` below.
+		if (isMetaModelActive(ctx.model)) void startLiveCatalogRefresh(pi, ctx);
+	});
+	pi.on("model_select", (event, ctx) => {
+		if (!isMetaModelActive(event.model)) return;
+		// The cooldown in `startLiveCatalogRefresh()` folds a session-start plus a
+		// restore/select pair into one fetch.
 		void startLiveCatalogRefresh(pi, ctx);
 	});
 	pi.on("before_provider_request", async (event, ctx) => {
 		if (ctx.model?.provider !== META_PROVIDER_ID) return undefined;
+		// A Meta turn is the strongest signal that the catalog fetch is worth its
+		// `META_PROXY` round trip — a resumed session whose `session_start` ran
+		// without a model still discovers the ids on the first real turn. The
+		// cooldown keeps it to one fetch per window.
+		void startLiveCatalogRefresh(pi, ctx);
 		let apiKey: string | undefined;
 		try {
 			apiKey = (await ctx.modelRegistry?.getProviderAuth(META_PROVIDER_ID))

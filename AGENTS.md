@@ -24,7 +24,10 @@ Pi 0.86 never runs a networked catalog refresh inside a session
 `allowModelNetwork`, and extension-triggered live passes get superseded by the
 startup refresh storm), and `pi update --models` does not load extensions — it
 refreshes pi's built-in static Meta catalog instead. So `session_start` runs
-`startLiveCatalogRefresh()`: fetch `GET /v1/models` with the resolved key,
+`startLiveCatalogRefresh()` — **only when the session's model already belongs to
+this provider** (`isMetaModelActive()`); `model_select` fires the same pass when
+the user switches to a Meta model, and the 4h cooldown folds the pair into one
+fetch: fetch `GET /v1/models` with the resolved key,
 store the result in the module-level `liveCatalog`, and re-register the
 provider so the picker and pi's model snapshot update without waiting for a
 refresh nobody triggers. Every later `refreshMetaModels()` pass — offline ones
@@ -32,6 +35,13 @@ included — recomposes from `liveCatalog` plus pi's own rows. This is what make
 keys whose account exposes only internal ids (e.g.
 `rl-muse-spark-1-3-sglang-playground`) work; pi's built-in provider 404s on
 them.
+
+The gate is not cosmetic: that fetch is the only place the extension opens a
+`META_PROXY` tunnel before a turn, and a session on any other provider must not
+pay for it. Measured 2026-11-04 with a logging `CONNECT` sink on
+`META_PROXY=http://127.0.0.1:8899`: a `deepseek/*` session opened **zero**
+tunnels, a `meta/muse-spark-1.3` session opened them on purpose. Both hooks are
+asserted in `tests/meta-cache.test.ts`.
 
 Two catalog rules measured 2026-10-11 with a live Muse Model API key:
 
@@ -249,6 +259,28 @@ unsettled bill answer `402 billing_not_configured` (they look healthy until a
 chat request), and a revoked key answers `401` on every surface including the
 catalog. Check a key with `/v1/models` **and** one `muse-spark-1.3` call through
 the exit you will actually use.
+
+Re-measured 2026-11-04 while the exit chain was being rebuilt (key from
+`secret.env`, `/v1/responses` with `muse-spark-1.3` and `muse-wonder-1.0`):
+
+- **direct** from a Georgian line → `GET /v1/models` 200 with 8 ids, chat 6/6
+  `404 model_not_found`. The catalog is not a geo test; only a chat call is.
+- **`http://192.168.88.248:8870`** (the LAN exit `NVIDIA_NIM_PROXY` also uses,
+  Frankfurt) → catalog 200 sometimes, `{"data":[]}` other times, chat 5/5 404.
+  Meta does **not** work through it.
+- **`niceproxy.io:17522`, `country-GB`** (the shape a seller hands out) →
+  `CONNECT api.meta.ai:443` is accepted and then never answered; the tunnel dies
+  on the client timeout. `country-US` / `country-CA` answer 200 (catalog lists 9
+  ids incl. `muse-wonder-1.0`) but a bad minute loses 4 of 6 attempts, with
+  1.3–2.4 s just to establish the tunnel.
+- **US datacenter exit** (`147.68.215.226:3128`) → 6/6 200, CONNECT+TLS 0.46 s.
+  That is what `~/.global-profile` now exports as `META_PROXY`, with the
+  residential US session as the second `META_PROXIES` endpoint; a dead first
+  endpoint still yields `pong`.
+
+Exit order is configuration, not code: if Meta ever starts refusing datacenter
+IPs, swap the two entries in `META_PROXIES` — measured with
+`META_PROXIES=<dead>:1,<live>` → `pong`.
 
 ## Transparent error handling
 

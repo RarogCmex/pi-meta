@@ -488,6 +488,62 @@ describe("Meta Responses cache and reasoning contracts", () => {
 		});
 	});
 
+	// The first real Meta turn is the last safety net: a session that started
+	// without a model still discovers its ids then, and a turn on any other
+	// provider stays away from the proxy.
+	test("a Meta turn triggers discovery, another provider's does not", async () => {
+		resetCatalogRefreshState();
+		type RequestHandler = (
+			event: { payload: unknown },
+			ctx: unknown,
+		) => unknown;
+		let handler: RequestHandler | undefined;
+		const registered: unknown[] = [];
+		metaOAuthProvider({
+			registerProvider(_id: string, config?: unknown) {
+				if (config) registered.push(config);
+			},
+			on(event: string, next: unknown) {
+				if (event === "before_provider_request") {
+					handler = next as RequestHandler;
+				}
+			},
+		} as unknown as ExtensionAPI);
+		let authCalls = 0;
+		const ctx = {
+			model: { provider: META_PROVIDER_ID, id: "muse-spark-1.3" },
+			modelRegistry: {
+				getProviderAuth: async () => {
+					authCalls += 1;
+					return { auth: { apiKey: "model-api-key" } };
+				},
+			},
+		};
+		const originalFetch = globalThis.fetch;
+		let catalogFetches = 0;
+		globalThis.fetch = (async () => {
+			catalogFetches += 1;
+			return jsonResponse({ data: [{ id: "muse-spark-1.3" }] });
+		}) as unknown as typeof fetch;
+		try {
+			await handler?.(
+				{ payload: { model: "x" } },
+				{ model: { provider: "openai", id: "gpt" } },
+			);
+			await Bun.sleep(30);
+			expect(catalogFetches).toBe(0);
+
+			await handler?.({ payload: { model: "x" } }, ctx);
+			const deadline = Date.now() + 5_000;
+			while (catalogFetches === 0 && Date.now() < deadline) await Bun.sleep(20);
+			// At least the catalog; the entitlement probe for this model rides along.
+			expect(catalogFetches).toBeGreaterThan(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+			resetCatalogRefreshState();
+		}
+	});
+
 	// Pi 0.86 runs every in-session refresh with allowNetwork:false, and the
 	// only networked caller (pi update --models) does not load extensions. An
 	// extension-triggered live pass is also superseded by pi's startup refresh
@@ -624,6 +680,8 @@ describe("Meta Responses cache and reasoning contracts", () => {
 					ui: {
 						notify: (message: string) => notices.push(message),
 					},
+					// The catalog pass only runs for a session already on Meta.
+					model: { provider: "meta", id: "muse-spark-1.3" },
 					modelRegistry: {
 						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
 					},
@@ -664,6 +722,8 @@ describe("Meta Responses cache and reasoning contracts", () => {
 				{
 					hasUI: true,
 					ui: { notify: (message: string) => notices.push(message) },
+					// Only a Meta session fetches the catalog, so only it can warn.
+					model: { provider: "meta", id: "muse-spark-1.3" },
 					modelRegistry: {
 						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
 					},
@@ -708,6 +768,7 @@ describe("Meta Responses cache and reasoning contracts", () => {
 			await sessionStart?.(
 				{ type: "session_start", reason: "startup" },
 				{
+					model: { provider: "meta", id: "muse-spark-1.3" },
 					modelRegistry: {
 						getProviderAuth: async () => ({ auth: { apiKey: "model-api-key" } }),
 					},
@@ -730,6 +791,120 @@ describe("Meta Responses cache and reasoning contracts", () => {
 			}
 			// One re-registration carrying the live ids, after the bundled default.
 			expect(live).toHaveLength(1);
+		} finally {
+			globalThis.fetch = originalFetch;
+			resetCatalogRefreshState();
+		}
+	});
+
+	// The catalog fetch is a `META_PROXY` round trip, so a session on another
+	// provider must not open one — not at startup, not when a model is picked.
+	test("never touches the proxy for a session on another provider", async () => {
+		resetCatalogRefreshState();
+		const handlers = new Map<string, unknown>();
+		metaOAuthProvider({
+			registerProvider() {},
+			on(event: string, next: unknown) {
+				handlers.set(event, next);
+			},
+		} as unknown as ExtensionAPI);
+		const sessionStart = handlers.get("session_start") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		const modelSelect = handlers.get("model_select") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		expect(modelSelect).toBeTypeOf("function");
+		let authCalls = 0;
+		const notices: string[] = [];
+		// A proxy that cannot even be parsed: reaching it would throw a notice.
+		const previous = process.env["META_PROXY"];
+		process.env["META_PROXY"] = "socks5://127.0.0.1:1080";
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (message: string) => notices.push(message) },
+			model: { provider: "alibaba-cloud", id: "qwen3.8-max-0902" },
+			modelRegistry: {
+				getProviderAuth: async () => {
+					authCalls += 1;
+					return { auth: { apiKey: "model-api-key" } };
+				},
+			},
+		};
+		try {
+			await sessionStart?.({ type: "session_start", reason: "startup" }, ctx);
+			await modelSelect?.(
+				{
+					type: "model_select",
+					model: { provider: "anthropic", id: "claude-sonnet-4.5" },
+					source: "set",
+				},
+				ctx,
+			);
+			await Bun.sleep(50);
+		} finally {
+			if (previous === undefined) delete process.env["META_PROXY"];
+			else process.env["META_PROXY"] = previous;
+			resetCatalogRefreshState();
+		}
+		expect(authCalls).toBe(0);
+		expect(notices).toEqual([]);
+	});
+
+	test("fetches the catalog the moment a Meta model is selected", async () => {
+		resetCatalogRefreshState();
+		const handlers = new Map<string, unknown>();
+		const registered: unknown[] = [];
+		metaOAuthProvider({
+			registerProvider(_id: string, config?: unknown) {
+				if (config) registered.push(config);
+			},
+			on(event: string, next: unknown) {
+				handlers.set(event, next);
+			},
+		} as unknown as ExtensionAPI);
+		const sessionStart = handlers.get("session_start") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		const modelSelect = handlers.get("model_select") as
+			| ((event: unknown, ctx: unknown) => unknown)
+			| undefined;
+		let authCalls = 0;
+		// `metaOAuthProvider()` registers once by itself; count the extra passes.
+		const baseline = registered.length;
+		const ctx = {
+			model: { provider: "anthropic", id: "claude-sonnet-4.5" },
+			modelRegistry: {
+				getProviderAuth: async () => {
+					authCalls += 1;
+					return { auth: { apiKey: "model-api-key" } };
+				},
+			},
+		};
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			jsonResponse({ data: [{ id: "muse-spark-1.3" }] })) as unknown as typeof fetch;
+		try {
+			await sessionStart?.({ type: "session_start", reason: "startup" }, ctx);
+			await Bun.sleep(50);
+			// Startup on another provider: no key lookup, no fetch.
+			expect(authCalls).toBe(0);
+			expect(registered).toHaveLength(baseline);
+
+			await modelSelect?.(
+				{
+					type: "model_select",
+					model: { provider: "meta", id: "muse-spark-1.3" },
+					source: "set",
+				},
+				ctx,
+			);
+			const deadline = Date.now() + 5_000;
+			while (registered.length === baseline && Date.now() < deadline) {
+				await Bun.sleep(20);
+			}
+			expect(authCalls).toBe(1);
+			expect(registered).toHaveLength(baseline + 1);
 		} finally {
 			globalThis.fetch = originalFetch;
 			resetCatalogRefreshState();
