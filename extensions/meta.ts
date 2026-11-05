@@ -1055,7 +1055,11 @@ function proxyNoticeOnce(key: string, now: number): boolean {
  */
 function describeProxyFailure(message: string): string {
 	const status = /CONNECT refused with HTTP (\d+)/i.exec(message);
-	if (status) return `the proxy answered CONNECT with HTTP ${status[1]}`;
+	// The status digits must not reach pi: its classifier retries any text that
+	// carries 429/500/502/503/504/520/524, so "answered CONNECT with HTTP 502"
+	// against `retry.maxRetries: 10` is the same 90 s hang the DNS typo caused.
+	// The exact code stays visible in `notifyProxyDown()`, which pi never reads.
+	if (status) return "the proxy answered the CONNECT handshake with an HTTP error";
 	if (/ENOTFOUND|EAI_AGAIN/i.test(message))
 		return "the proxy host name does not resolve";
 	if (/ECONNREFUSED/i.test(message))
@@ -1165,7 +1169,12 @@ export function resetMetaProxyFailure(): void {
  */
 export function createMetaProxyFetch(
 	proxyUrl: string | string[],
-	options: { now?: () => number; connectTimeoutMs?: number } = {},
+	options: {
+		now?: () => number;
+		connectTimeoutMs?: number;
+		/** Extra CA bundle for the tunneled TLS leg — hermetic test seam. */
+		ca?: string | Buffer;
+	} = {},
 ): Fetch {
 	const now = options.now ?? Date.now;
 	const connectTimeoutMs =
@@ -1226,6 +1235,7 @@ export function createMetaProxyFetch(
 		let lastError: unknown;
 		for (const [index, endpoint] of candidates.entries()) {
 			if (signal?.aborted) break;
+			let secured: import("node:tls").TLSSocket;
 			try {
 				const tunnel = await openProxyTunnel({
 					proxyHost: endpoint.host,
@@ -1236,16 +1246,16 @@ export function createMetaProxyFetch(
 					signal,
 					timeoutMs: connectTimeoutMs,
 				});
-				const secured = await startTunnelTls(
+				secured = await startTunnelTls(
 					tunnel,
 					target.hostname,
 					signal,
 					connectTimeoutMs,
+					options.ca,
 				);
-				quarantineUntil.delete(endpoint.href);
-				return await sendOverTunnel(secured, target, headers, payload, init, signal);
 			} catch (error) {
-				// A response was never received, so the endpoint is the suspect.
+				// The tunnel never came up, so the endpoint is the suspect: quarantine
+				// it and let the next one try.
 				quarantineUntil.set(endpoint.href, now() + META_PROXY_QUARANTINE_MS);
 				lastError = error;
 				const next = candidates[index + 1];
@@ -1257,7 +1267,14 @@ export function createMetaProxyFetch(
 						: "no endpoint left",
 					now(),
 				);
+				continue;
 			}
+			// The tunnel is up: this endpoint did its job. Whatever the target
+			// answers — even a hang-up before the first byte — is Meta's business,
+			// not the exit's, and the request is *not* replayed against another
+			// endpoint (a POST would reach Meta twice and be billed twice).
+			quarantineUntil.delete(endpoint.href);
+			return await sendOverTunnel(secured, target, headers, payload, init, signal);
 		}
 		notifyProxyExhausted(
 			candidates.map((endpoint) => endpoint.display),
@@ -1386,6 +1403,7 @@ async function startTunnelTls(
 	host: string,
 	signal?: AbortSignal,
 	timeoutMs: number = META_PROXY_CONNECT_TIMEOUT_MS,
+	ca?: string | Buffer,
 ): Promise<import("node:tls").TLSSocket> {
 	const { connect } = await import("node:tls");
 	return await new Promise((resolve, reject) => {
@@ -1395,10 +1413,13 @@ async function startTunnelTls(
 				new Error(`pi-meta: TLS to ${host} timed out after ${timeoutMs} ms`),
 			);
 		}, timeoutMs);
-		const secured = connect({ socket, servername: host }, () => {
-			clearTimeout(timer);
-			resolve(secured);
-		});
+		const secured = connect(
+			{ socket, servername: host, ...(ca === undefined ? {} : { ca }) },
+			() => {
+				clearTimeout(timer);
+				resolve(secured);
+			},
+		);
 		secured.on("error", (error: Error) => {
 			clearTimeout(timer);
 			reject(error);
@@ -1817,6 +1838,24 @@ export const FLAKY_NOT_FOUND_META_RETRY: MetaRetryConfig = {
 	maxRetries: 7,
 	minDelayMs: 250,
 	maxDelayMs: 1_000,
+};
+
+/**
+ * A whole endpoint list failing *before the tunnel* is a bad minute, not a
+ * verdict. Measured 2026-11-04: a residential exit lost 4 of 6 CONNECTs inside
+ * one bad minute and answered in 2–3 s a minute later, while the US datacenter
+ * exit never failed in 18 attempts — so a single blink of the whole list used to
+ * kill a turn that a second pass would have saved. One extra pass, and no more:
+ * a hung CONNECT already costs `META_PROXY_CONNECT_TIMEOUT_MS` per endpoint per
+ * pass, so depth here is measured in tens of seconds.
+ *
+ * Only tunnel-phase failures reach this budget — a target that hangs up after
+ * the tunnel is up is Meta's failure, and it is never blamed on the exit.
+ */
+export const PROXY_EXHAUSTED_META_RETRY: MetaRetryConfig = {
+	maxRetries: 1,
+	minDelayMs: 500,
+	maxDelayMs: 500,
 };
 
 function effectiveRetryConfig(
@@ -2302,18 +2341,26 @@ export function streamMetaSimple(
 			learnFromMetaError(errorText, model.id, options?.apiKey);
 
 			const knownModel = isKnownMetaModelId(model.id, options?.apiKey);
-			const budget = effectiveRetryConfig(
-				errorText,
-				knownModel,
-				config,
-				deps.config !== undefined,
-			);
+			// A failure the transport already attributed to the exits (every tunnel
+			// attempt died) gets its own short budget: the synthetic message below is
+			// terminal for *pi*, and retrying it inside this layer is exactly the
+			// bounded retry the user cannot see.
+			const retryableByProxy = proxyFailure !== undefined;
+			const budget = retryableByProxy
+				? (deps.config ?? PROXY_EXHAUSTED_META_RETRY)
+				: effectiveRetryConfig(
+						errorText,
+						knownModel,
+						config,
+						deps.config !== undefined,
+					);
 			const retryable =
 				enabled &&
 				!options?.signal?.aborted &&
 				!result.committed &&
 				attempt <= budget.maxRetries &&
-				isRetryableMetaError(failure, model.contextWindow, knownModel);
+				(retryableByProxy ||
+					isRetryableMetaError(failure, model.contextWindow, knownModel));
 			if (!retryable) {
 				// Retried and still 404: stop paying the backoff for this id until a
 				// turn succeeds again. `attempt > 1` keeps an id nothing ever vouched

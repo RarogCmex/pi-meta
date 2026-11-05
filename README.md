@@ -99,6 +99,12 @@ Failures are loud and terminal:
 
 - Reaching an exit is capped at 10 s (CONNECT answer + TLS), so a proxy that
   swallows the connection cannot hang the turn.
+- A tunnel that came up is a working exit, whatever the target does next: a
+  hang-up before the first response byte is Meta's failure, not the proxy's — no
+  warning, no quarantine, and the request is never replayed against another exit
+  (a POST would reach Meta twice).
+- When *every* exit fails at `CONNECT`, the retry layer gets one extra pass with
+  fresh tunnels (500 ms later) before the turn is called dead.
 - Every dead endpoint raises a warning naming it (`proxy 1.2.3.4:3128 failed …`),
   and exhausting the list raises an error with the full list — deduped per
   60 s window, so a retry loop cannot turn them into a stream.
@@ -106,8 +112,10 @@ Failures are loud and terminal:
   `pi-meta: META_PROXY endpoint <host:port> is unusable — <reason>. Check
   META_PROXY/META_PROXIES (see README); this request never reached Meta.`
   That wording is deliberate: pi retries whatever its classifier calls
-  transient, and the raw `getaddrinfo ENOTFOUND …` is in that set — measured, a
-  dead exit against `retry.maxRetries: 10` hung for 90 s before this.
+  transient, and both the raw `getaddrinfo ENOTFOUND …` and any bare
+  `500/502/503/504` are in that set — measured, a dead exit against
+  `retry.maxRetries: 10` hung for 90 s before this. The status code therefore
+  stays in the warning and never in the terminal sentence.
 - An empty catalog warning says so too: no model access **or** a country-blocked
   exit (`… or this network's exit is blocked by Meta's country restrictions …`).
 

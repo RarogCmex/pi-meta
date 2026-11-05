@@ -1,7 +1,13 @@
 /// <reference types="bun-types" />
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
+import { createServer as createHttpsServer } from "node:https";
+import {
+	connect as connectTcp,
+	createServer as createTcpServer,
+	type Server as TcpServer,
+} from "node:net";
 import type { AddressInfo } from "node:net";
 
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
@@ -62,6 +68,42 @@ function startProxy(
 		});
 	});
 }
+
+/**
+ * A proxy that actually tunnels: it accepts every `CONNECT` and dials a fixed
+ * local port, which is how the TLS leg and the HTTP-over-tunnel request can be
+ * exercised without reaching Meta.
+ */
+function startTunnelingProxy(
+	targetPort: number,
+): Promise<{ url: string; connects: number }> {
+	const state = { url: "", connects: 0 };
+	const server = createServer();
+	server.on("connect", (req, client, head) => {
+		state.connects += 1;
+		const upstream = connectTcp(targetPort, "127.0.0.1", () => {
+			client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+			if (head.length > 0) upstream.write(head);
+			client.pipe(upstream);
+			upstream.pipe(client);
+		});
+		upstream.on("error", () => client.destroy());
+		client.on("error", () => upstream.destroy());
+		void req;
+	});
+	servers.push(server);
+	return new Promise((resolve) => {
+		server.listen(0, "127.0.0.1", () => {
+			const { port } = server.address() as AddressInfo;
+			state.url = `http://127.0.0.1:${port}`;
+			resolve(state);
+		});
+	});
+}
+
+const fixtureDir = new URL("./fixtures/", import.meta.url);
+const testCert = readFileSync(new URL("meta-test-cert.pem", fixtureDir), "utf8");
+const testKey = readFileSync(new URL("meta-test-key.pem", fixtureDir), "utf8");
 
 describe("META_PROXY parsing", () => {
 	test("accepts a bare host:port and assumes http://", () => {
@@ -337,5 +379,153 @@ describe("META_PROXY transport", () => {
 
 		expect(proxy.see).toHaveLength(2);
 		expect(META_PROXY_QUARANTINE_MS).toBe(60_000);
+	});
+
+	// The `socket hang up` reports come from this shape: the tunnel is up and the
+	// *target* drops the connection before the first response byte. Blaming the
+	// exit for that is wrong twice — it quarantines a healthy endpoint, and it
+	// replays the request against the next exit, so a POST reaches Meta twice.
+	test("a target that hangs up after the tunnel is not blamed on the exit", async () => {
+		const notices: string[] = [];
+		bindMetaStreamState({ notify: (message) => notices.push(message) });
+		let calls = 0;
+		const tls = createHttpsServer(
+			{ cert: testCert, key: testKey },
+			(req, res) => {
+				calls += 1;
+				if (calls === 2) {
+					// Hang up before a single response byte.
+					req.socket.destroy();
+					return;
+				}
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ object: "list", data: [] }));
+			},
+		);
+		servers.push(tls as unknown as Server);
+		await new Promise<void>((resolve) => tls.listen(0, "127.0.0.1", resolve));
+		const tlsPort = (tls.address() as AddressInfo).port;
+
+		const unusedExit = await startProxy(() => 502);
+		const proxy = await startTunnelingProxy(tlsPort);
+		const proxied = createMetaProxyFetch([proxy.url, unusedExit.url], {
+			ca: testCert,
+		});
+
+		const first = await proxied(`https://meta.test:${tlsPort}/v1/models`);
+		expect(first.status).toBe(200);
+		await first.text();
+
+		const failure = await proxied(`https://meta.test:${tlsPort}/v1/models`).catch(
+			(error: Error) => error,
+		);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).not.toContain("META_PROXY endpoint");
+		expect(notices).toEqual([]);
+		// No failover: the request was not replayed against the second exit.
+		expect(unusedExit.see).toHaveLength(0);
+		expect(proxy.connects).toBe(2);
+
+		// The exit was never quarantined: the very next request goes to it.
+		const third = await proxied(`https://meta.test:${tlsPort}/v1/models`);
+		expect(third.status).toBe(200);
+		await third.text();
+		expect(unusedExit.see).toHaveLength(0);
+	});
+
+	// Measured 2026-11-04: one blink of the whole list (both exits refusing at
+	// CONNECT) killed a turn that a second pass would have saved. One extra pass,
+	// then the terminal message pi will not retry.
+	test("a whole exit list failing at CONNECT gets exactly one more pass", async () => {
+		const model = {
+			id: "muse-spark-1.3",
+			name: "Muse Spark 1.3",
+			provider: "meta",
+			api: "openai-responses",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: true,
+			input: ["text"],
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+		} as never;
+		const dead = await startProxy(() => 502);
+		const delays: number[] = [];
+		const retries: number[] = [];
+		resetMetaProxyFetch();
+		resetMetaProxyNotices();
+		resetMetaProxyFailure();
+
+		const stream = streamMetaSimple(
+			model,
+			{ messages: [{ role: "user", content: "say pong" }] } as never,
+			{ apiKey: "dead-exit" },
+			{
+				env: { META_PROXY: dead.url },
+				sleep: async (delayMs: number) => {
+					delays.push(delayMs);
+					return false;
+				},
+				onRetryScheduled: (info) => retries.push(info.attempt),
+			},
+		);
+
+		let terminal: { type?: string; error?: unknown } = {};
+		for await (const event of stream) terminal = event as never;
+
+		// One retry after the first exhausted list, then the verdict.
+		expect(retries).toEqual([1]);
+		expect(delays).toEqual([500]);
+		expect(dead.see).toHaveLength(2);
+		expect(terminal.type).toBe("error");
+		const message = (terminal as { error: { errorMessage?: string } }).error;
+		expect(message.errorMessage).toContain("META_PROXY endpoint");
+		expect(isRetryableAssistantError(message as never)).toBe(false);
+	});
+
+	// Same class, different wording: an exit that answers the CONNECT with a 5xx.
+	// pi's classifier retries anything carrying 502/503/504, so the digits must
+	// not ride in the message pi sees — the status stays in the warning only.
+	test("a 5xx CONNECT answer reaches pi without a retryable status code", async () => {
+		const model = {
+			id: "muse-spark-1.3",
+			name: "Muse Spark 1.3",
+			provider: "meta",
+			api: "openai-responses",
+			baseUrl: "https://api.meta.ai/v1",
+			reasoning: true,
+			input: ["text"],
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+		} as never;
+		const notices: string[] = [];
+		bindMetaStreamState({ notify: (message) => notices.push(message) });
+		const proxy = await startProxy(() => 502);
+		resetMetaProxyFetch();
+		resetMetaProxyNotices();
+		resetMetaProxyFailure();
+
+		const stream = streamMetaSimple(
+			model,
+			{ messages: [{ role: "user", content: "say pong" }] } as never,
+			{ apiKey: "bad-exit" },
+			{
+				env: { META_PROXY: proxy.url },
+				sleep: async () => false,
+			},
+		);
+		let terminal: { type?: string; error?: unknown } = {};
+		for await (const event of stream) terminal = event as never;
+
+		const message = (terminal as { error: { errorMessage?: string } }).error;
+		expect(message.errorMessage).toContain("META_PROXY endpoint");
+		expect(message.errorMessage).toContain(
+			"answered the CONNECT handshake with an HTTP error",
+		);
+		expect(message.errorMessage).not.toContain("502");
+		expect(isRetryableAssistantError(message as never)).toBe(false);
+		// The exact code is still visible to the user, in the warning.
+		expect(notices.join("\n")).toContain("HTTP 502");
 	});
 });

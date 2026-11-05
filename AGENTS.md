@@ -282,6 +282,30 @@ Exit order is configuration, not code: if Meta ever starts refusing datacenter
 IPs, swap the two entries in `META_PROXIES` — measured with
 `META_PROXIES=<dead>:1,<live>` → `pong`.
 
+Three rules learned from the `socket hang up` reports (fixed 2026-11-04, all
+asserted in `tests/meta-proxy.test.ts`):
+
+1. **Phase decides the suspect.** A tunnel that never came up is the exit's
+   fault: quarantine it, warn, try the next one. Once the tunnel is up, the
+   endpoint did its job — a hang-up before the first response byte is Meta's
+   failure and the request is **not** replayed against another exit (a POST
+   would reach Meta twice and be billed twice). Before the split, a
+   meta-side hang-up quarantined a healthy exit, blamed it in the UI, and
+   re-sent the request — which is how a single Meta hiccup produced
+   `proxy A failed … trying the next endpoint … no proxy endpoint is reachable`
+   naming two innocent exits.
+2. **A blank page of exits is a bad minute, not a verdict.** When every endpoint
+   fails at CONNECT, the retry layer gets one extra pass
+   (`PROXY_EXHAUSTED_META_RETRY`, 500 ms) with fresh tunnels. One pass, not
+   three: a hung CONNECT already costs `META_PROXY_CONNECT_TIMEOUT_MS` per
+   endpoint per pass.
+3. **No status digits in the pi-visible message.** pi's classifier retries
+   anything carrying `429|500|502|503|504|520|524`, so an exit answering
+   `CONNECT` with 502 used to reach pi as a retryable turn — the same 90 s hang
+   the DNS typo caused. The terminal sentence now says "answered the CONNECT
+   handshake with an HTTP error"; the exact code stays in the warning
+   (`notifyProxyDown`), which pi never classifies.
+
 ## Transparent error handling
 
 `api.meta.ai` answers a flooded or slow request with HTTP 5xx — most often 504

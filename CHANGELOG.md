@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `META_PROXY`: a `deepseek/*` session opens zero tunnels, a
   `meta/muse-spark-1.3` session opens them as before.
 
+### Fixed
+
+- **A `socket hang up` from Meta is no longer charged to the proxy.** The tunnel
+  and the request over it were one `try`, so a target that dropped the
+  connection after `CONNECT` quarantined a healthy exit, told the user the proxy
+  was unusable, and replayed the request against the next endpoint — a POST
+  arriving at Meta twice. The phases are split now: only a tunnel that never came
+  up quarantines an exit and advances the list; a post-tunnel failure goes
+  straight back to the retry layer.
+- **A blank page of exits gets one more pass.** When every endpoint fails at
+  `CONNECT`, `PROXY_EXHAUSTED_META_RETRY` re-issues the request once, 500 ms
+  later, with fresh tunnels instead of failing the turn on a bad second.
+- **A 5xx `CONNECT` answer no longer becomes a retryable turn.** The terminal
+  sentence used to carry the status (`… answered CONNECT with HTTP 502`), and
+  pi's classifier retries any text with `500|502|503|504` — the same 90 s hang
+  the DNS typo caused. The message now says "answered the CONNECT handshake with
+  an HTTP error"; the exact code stays in the warning, which pi never reads.
+
 ## [0.10.3] - 2026-11-03
 
 ### Added
